@@ -1,2 +1,3 @@
 aroio_filmcomp
 *.o
+dist/
