@@ -776,9 +776,13 @@ int engine_start(const char *name, int port) {
 	 * process hangs on pthread_join during shutdown. */
 	struct timeval rcv_timeout = { .tv_sec = 0, .tv_usec = 200000 };
 	setsockopt(osc_socket, SOL_SOCKET, SO_RCVTIMEO, &rcv_timeout, sizeof(rcv_timeout));
+	/* Bind to INADDR_ANY so LAN clients (cycle script on amos via LIRC,
+	 * other remote control) can drive presets. Personal-LAN scope; if
+	 * this ever runs on a multi-tenant host, an explicit allow-list
+	 * would be needed. */
 	struct sockaddr_in addr = {
 		.sin_family = AF_INET,
-		.sin_addr = { .s_addr = htonl(INADDR_LOOPBACK) },
+		.sin_addr = { .s_addr = htonl(INADDR_ANY) },
 		.sin_port = htons(osc_port),
 	};
 	if (bind(osc_socket, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
