@@ -33,7 +33,7 @@ else
         -v "$PKGROOT":/build \
         "$DOCKER_IMAGE" bash -c "
             apt-get update -qq >/dev/null &&
-            apt-get install -y -qq libjack-jackd2-dev libglfw3-dev libgl-dev pkg-config >/dev/null &&
+            apt-get install -y -qq build-essential libjack-jackd2-dev libglfw3-dev libgl-dev pkg-config >/dev/null &&
             cd /build && make clean && make &&
             chown $(id -u):$(id -g) aroio_filmcomp src/*.o vendor/imgui/*.o vendor/imgui/backends/*.o 2>/dev/null || true
         "

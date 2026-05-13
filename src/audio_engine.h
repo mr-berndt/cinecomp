@@ -76,6 +76,46 @@ void  engine_set_param_i(engine_param_t id, int value);
  * — calling resets them so the GUI sees per-frame maxima. */
 void engine_read_meters(engine_meters_t *out);
 
+/* ----------------------- Presets --------------------------------------- */
+
+typedef enum {
+    PRESET_LOW       = 0,
+    PRESET_MID       = 1,
+    PRESET_HIGH      = 2,
+    PRESET__COUNT
+} engine_preset_slot_t;
+
+/* Snapshot of all preset-controlled params (everything except bypass).
+ * Returned by engine_preset_get(); accepted by engine_preset_set(). The
+ * field order is stable and mirrors PARAM_* IDs up to PARAM__FLOAT_COUNT
+ * for floats; ints follow. */
+typedef struct {
+    float f[PARAM__FLOAT_COUNT];
+    int   detector_mode;
+    int   downward_en;
+} engine_preset_t;
+
+/* Apply a preset: copy preset[slot] into live atomic params, mark as
+ * active. Returns 0 on success. */
+int  engine_preset_apply(engine_preset_slot_t slot);
+
+/* Save: read current live param values into preset[slot]. */
+void engine_preset_save(engine_preset_slot_t slot);
+
+/* Reset preset[slot] back to factory defaults. */
+void engine_preset_reset(engine_preset_slot_t slot);
+
+/* Active preset slot getter (last applied). May be -1 if nothing
+ * applied yet (initial boot, custom edits). */
+int  engine_preset_active(void);
+
+/* GUI-facing get/set for persistence to disk. */
+void engine_preset_get(engine_preset_slot_t slot, engine_preset_t *out);
+void engine_preset_set(engine_preset_slot_t slot, const engine_preset_t *in);
+
+/* Label string for a slot, e.g. "low", "mid", "high". */
+const char *engine_preset_name(engine_preset_slot_t slot);
+
 #ifdef __cplusplus
 }
 #endif

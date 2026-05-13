@@ -32,6 +32,9 @@
  *     /filmcomp/downward/threshold f
  *     /filmcomp/downward/ratio f
  *     /filmcomp/bypass i             — 0/1 (default 1 at boot)
+ *     /filmcomp/preset/select i      — apply preset N (0=low 1=mid 2=high)
+ *     /filmcomp/preset/save   i      — save current params to preset N
+ *     /filmcomp/preset/reset  i      — reset preset N to factory defaults
  *     /filmcomp/subscribe            — sender added to broadcast list
  *     /filmcomp/unsubscribe          — sender removed
  *     /filmcomp/get                  — request current state
@@ -60,6 +63,8 @@
 #include <unistd.h>
 
 #include <jack/jack.h>
+
+#include "audio_engine.h"
 
 /* FTZ/DAZ: flush sub-normal floats. Same rationale as in aroio_volctl —
  * smoothing through denormals on x86 causes severe slowdowns. */
@@ -631,6 +636,7 @@ static void send_state(struct sockaddr_in *dst) {
 	send_one_float(dst, "/filmcomp/downward/threshold", atomic_load_explicit(&p_down_threshold, memory_order_relaxed));
 	send_one_float(dst, "/filmcomp/downward/ratio",     atomic_load_explicit(&p_down_ratio,     memory_order_relaxed));
 	send_one_int  (dst, "/filmcomp/bypass",     atomic_load_explicit(&p_bypass,       memory_order_relaxed));
+	send_one_int  (dst, "/filmcomp/preset/active", engine_preset_active());
 }
 
 static int sockaddr_eq(const struct sockaddr_in *a, const struct sockaddr_in *b) {
@@ -693,6 +699,9 @@ static void handle_osc(const uint8_t *buf, int len, struct sockaddr_in *src) {
 	else if (strcmp(path, "/filmcomp/downward/threshold") == 0) atomic_store(&p_down_threshold, fclampf(READ_F(-6.0f), -60.0f, 0.0f));
 	else if (strcmp(path, "/filmcomp/downward/ratio") == 0) atomic_store(&p_down_ratio, fclampf(READ_F(4.0f), 1.0f, 20.0f));
 	else if (strcmp(path, "/filmcomp/bypass") == 0) atomic_store(&p_bypass, READ_I(1) ? 1 : 0);
+	else if (strcmp(path, "/filmcomp/preset/select") == 0) engine_preset_apply((engine_preset_slot_t)READ_I(1));
+	else if (strcmp(path, "/filmcomp/preset/save")   == 0) engine_preset_save((engine_preset_slot_t)READ_I(engine_preset_active() < 0 ? 1 : engine_preset_active()));
+	else if (strcmp(path, "/filmcomp/preset/reset")  == 0) engine_preset_reset((engine_preset_slot_t)READ_I(engine_preset_active() < 0 ? 1 : engine_preset_active()));
 	else if (strcmp(path, "/filmcomp/subscribe") == 0) subscribe(src);
 	else if (strcmp(path, "/filmcomp/unsubscribe") == 0) unsubscribe(src);
 	else if (strcmp(path, "/filmcomp/get") == 0) send_state(src);
@@ -750,8 +759,6 @@ static int jack_register_ports(void) {
 
 /* ----------------------------- Public engine API --------------------- */
 
-#include "audio_engine.h"
-
 static pthread_t osc_th, peak_th;
 static int engine_running = 0;
 
@@ -763,6 +770,12 @@ int engine_start(const char *name, int port) {
 
 	osc_socket = socket(AF_INET, SOCK_DGRAM, 0);
 	if (osc_socket < 0) { perror("socket"); return -1; }
+	/* SO_RCVTIMEO so recvfrom() returns periodically and the OSC thread
+	 * can observe `running == 0` on engine_stop(). Without this, close()
+	 * is not guaranteed to wake a blocked recvfrom in glibc/Linux and the
+	 * process hangs on pthread_join during shutdown. */
+	struct timeval rcv_timeout = { .tv_sec = 0, .tv_usec = 200000 };
+	setsockopt(osc_socket, SOL_SOCKET, SO_RCVTIMEO, &rcv_timeout, sizeof(rcv_timeout));
 	struct sockaddr_in addr = {
 		.sin_family = AF_INET,
 		.sin_addr = { .s_addr = htonl(INADDR_LOOPBACK) },
@@ -806,17 +819,55 @@ int engine_start(const char *name, int port) {
 void engine_stop(void) {
 	if (!engine_running) return;
 	running = 0;
+
+	/* Wake the OSC server thread out of recvfrom() immediately by sending
+	 * a dummy packet to our own bound port. SO_RCVTIMEO alone has shown
+	 * to occasionally not fire reliably on some kernels; this guarantees
+	 * wakeup. */
+	if (osc_socket >= 0) {
+		int wake = socket(AF_INET, SOCK_DGRAM, 0);
+		if (wake >= 0) {
+			struct sockaddr_in dst = {
+				.sin_family = AF_INET,
+				.sin_addr   = { .s_addr = htonl(INADDR_LOOPBACK) },
+				.sin_port   = htons(0),
+			};
+			/* Read our own bound port and reuse it as dst */
+			socklen_t len = sizeof(dst);
+			if (getsockname(osc_socket, (struct sockaddr*)&dst, &len) == 0) {
+				char b = 0;
+				sendto(wake, &b, 1, 0, (struct sockaddr*)&dst, sizeof(dst));
+			}
+			close(wake);
+		}
+	}
+
 	if (client) {
 		jack_deactivate(client);
 		jack_client_close(client);
 		client = NULL;
 	}
 	if (osc_socket >= 0) {
+		shutdown(osc_socket, SHUT_RDWR);
 		close(osc_socket);
 		osc_socket = -1;
 	}
-	pthread_join(osc_th,  NULL);
-	pthread_join(peak_th, NULL);
+	/* pthread_timedjoin_np lets us exit even if a thread is stuck
+	 * (e.g. JACK quirk or PipeWire-JACK shutdown delay). 500 ms is
+	 * generous given recvfrom timeout is 200 ms. */
+	struct timespec ts;
+	clock_gettime(CLOCK_REALTIME, &ts);
+	ts.tv_nsec += 500 * 1000 * 1000;
+	if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+	if (pthread_timedjoin_np(osc_th,  NULL, &ts) != 0)
+		pthread_cancel(osc_th);
+
+	clock_gettime(CLOCK_REALTIME, &ts);
+	ts.tv_nsec += 200 * 1000 * 1000;
+	if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+	if (pthread_timedjoin_np(peak_th, NULL, &ts) != 0)
+		pthread_cancel(peak_th);
+
 	engine_running = 0;
 }
 
@@ -895,4 +946,163 @@ void engine_read_meters(engine_meters_t *out) {
 	}
 	out->sc_db   = atomic_load_explicit(&current_sc_db,           memory_order_relaxed);
 	out->gain_db = atomic_load_explicit(&current_gain_atomic_db,  memory_order_relaxed);
+}
+
+/* ----------------------- Presets ---------------------------------------
+ * Three named slots. Factory defaults mirror Nicola's mpv compressor
+ * profiles (LOW/MID/HIGH) but populate all 14 filmcomp float params plus
+ * detector_mode + downward_en. MID matches the boot defaults above
+ * (Wecker-getestet 2026-05-12). LOW is gentle (low ratio, sparingly
+ * boost); HIGH is aggressive (more lift, lower threshold). */
+/* Factory-presets aligned to Nicola's tuning (2026-05-13, cinema-
+ * verified on convolver against John-Wick double-shot, A-Quiet-Place
+ * tinker scene, Wecker scene). All three share fast peak detection
+ * (sc_hpf=20 catches LFE thumps in SC), 20ms lookahead, knee 6.1.
+ *
+ *   LOW  — konservativer Loudness-Lift mit Knee-Rolloff (Duck off).
+ *          +5.7 dB Atmo, dialog +4, Action sanft gerundet.
+ *   MID  — echte Dynamik-Range-Compression (Duck on -10/5:1).
+ *          +10 dB Atmo, dialog +7.5, Action -5.6.
+ *   HIGH — Dialog-Max (Lift bis Cap-Dialog) für arge Modern-Cinema-
+ *          Dynamik. +14 dB Atmo+Dialog, Action -5.6. */
+static const engine_preset_t factory_presets[PRESET__COUNT] = {
+	[PRESET_LOW] = {
+		.f = {
+			[PARAM_THRESHOLD]    =   0.0f,
+			[PARAM_RATIO]        =  3.6f,
+			[PARAM_ATTACK_MS]    =  5.0f,
+			[PARAM_RELEASE_MS]   = 56.0f,
+			[PARAM_HOLD_MS]      =  0.0f,
+			[PARAM_KNEE_DB]      =  6.1f,
+			[PARAM_MAKEUP_DB]    = -10.3f,
+			[PARAM_WET_DRY]      =  1.0f,
+			[PARAM_RMS_WIN_MS]   = 33.0f,
+			[PARAM_SC_HPF_HZ]    = 20.0f,
+			[PARAM_LOOKAHEAD_MS] = 20.0f,
+			[PARAM_MAX_GAIN_DB]  = 16.3f,
+			[PARAM_DOWN_THRESHOLD] = -6.0f,
+			[PARAM_DOWN_RATIO]   =  2.5f,
+		},
+		.detector_mode = 1,
+		.downward_en   = 0,
+	},
+	[PRESET_MID] = {
+		.f = {
+			[PARAM_THRESHOLD]    = -10.0f,
+			[PARAM_RATIO]        =  4.0f,
+			[PARAM_ATTACK_MS]    =  5.0f,
+			[PARAM_RELEASE_MS]   = 20.0f,
+			[PARAM_HOLD_MS]      =  0.0f,
+			[PARAM_KNEE_DB]      =  6.1f,
+			[PARAM_MAKEUP_DB]    =  0.0f,
+			[PARAM_WET_DRY]      =  1.0f,
+			[PARAM_RMS_WIN_MS]   = 60.0f,
+			[PARAM_SC_HPF_HZ]    = 20.0f,
+			[PARAM_LOOKAHEAD_MS] = 20.0f,
+			[PARAM_MAX_GAIN_DB]  = 10.0f,
+			[PARAM_DOWN_THRESHOLD] = -6.0f,
+			[PARAM_DOWN_RATIO]   =  4.0f,
+		},
+		.detector_mode = 1,
+		.downward_en   = 1,
+	},
+	[PRESET_HIGH] = {
+		.f = {
+			[PARAM_THRESHOLD]    = -10.0f,
+			[PARAM_RATIO]        =  6.0f,
+			[PARAM_ATTACK_MS]    =  5.0f,
+			[PARAM_RELEASE_MS]   = 20.0f,
+			[PARAM_HOLD_MS]      =  0.0f,
+			[PARAM_KNEE_DB]      =  6.1f,
+			[PARAM_MAKEUP_DB]    =  0.0f,
+			[PARAM_WET_DRY]      =  1.0f,
+			[PARAM_RMS_WIN_MS]   = 60.0f,
+			[PARAM_SC_HPF_HZ]    = 20.0f,
+			[PARAM_LOOKAHEAD_MS] = 20.0f,
+			[PARAM_MAX_GAIN_DB]  = 14.0f,
+			[PARAM_DOWN_THRESHOLD] = -6.0f,
+			[PARAM_DOWN_RATIO]   =  4.0f,
+		},
+		.detector_mode = 1,
+		.downward_en   = 1,
+	},
+};
+
+/* User-editable copies. Initially identical to factory; survive across
+ * runs via state.ini persistence. */
+static engine_preset_t presets[PRESET__COUNT];
+static pthread_mutex_t  preset_mtx = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic int      active_preset_slot = -1;
+static int              presets_initialised = 0;
+
+static void preset_init_once(void) {
+	if (presets_initialised) return;
+	for (int i = 0; i < PRESET__COUNT; i++) presets[i] = factory_presets[i];
+	presets_initialised = 1;
+}
+
+static const char *preset_names[PRESET__COUNT] = { "low", "mid", "high" };
+
+const char *engine_preset_name(engine_preset_slot_t slot) {
+	if (slot < 0 || slot >= PRESET__COUNT) return "?";
+	return preset_names[slot];
+}
+
+int engine_preset_apply(engine_preset_slot_t slot) {
+	if (slot < 0 || slot >= PRESET__COUNT) return -1;
+	preset_init_once();
+	pthread_mutex_lock(&preset_mtx);
+	engine_preset_t p = presets[slot];
+	pthread_mutex_unlock(&preset_mtx);
+
+	for (int i = 0; i < PARAM__FLOAT_COUNT; i++) {
+		engine_set_param_f((engine_param_t)i, p.f[i]);
+	}
+	engine_set_param_i(PARAM_DETECTOR_MODE, p.detector_mode);
+	engine_set_param_i(PARAM_DOWNWARD_EN,   p.downward_en);
+	atomic_store(&active_preset_slot, (int)slot);
+	return 0;
+}
+
+void engine_preset_save(engine_preset_slot_t slot) {
+	if (slot < 0 || slot >= PRESET__COUNT) return;
+	preset_init_once();
+	engine_preset_t p;
+	for (int i = 0; i < PARAM__FLOAT_COUNT; i++) {
+		p.f[i] = engine_get_param_f((engine_param_t)i);
+	}
+	p.detector_mode = engine_get_param_i(PARAM_DETECTOR_MODE);
+	p.downward_en   = engine_get_param_i(PARAM_DOWNWARD_EN);
+
+	pthread_mutex_lock(&preset_mtx);
+	presets[slot] = p;
+	pthread_mutex_unlock(&preset_mtx);
+}
+
+void engine_preset_reset(engine_preset_slot_t slot) {
+	if (slot < 0 || slot >= PRESET__COUNT) return;
+	preset_init_once();
+	pthread_mutex_lock(&preset_mtx);
+	presets[slot] = factory_presets[slot];
+	pthread_mutex_unlock(&preset_mtx);
+}
+
+int engine_preset_active(void) {
+	return atomic_load(&active_preset_slot);
+}
+
+void engine_preset_get(engine_preset_slot_t slot, engine_preset_t *out) {
+	if (!out || slot < 0 || slot >= PRESET__COUNT) return;
+	preset_init_once();
+	pthread_mutex_lock(&preset_mtx);
+	*out = presets[slot];
+	pthread_mutex_unlock(&preset_mtx);
+}
+
+void engine_preset_set(engine_preset_slot_t slot, const engine_preset_t *in) {
+	if (!in || slot < 0 || slot >= PRESET__COUNT) return;
+	preset_init_once();
+	pthread_mutex_lock(&preset_mtx);
+	presets[slot] = *in;
+	pthread_mutex_unlock(&preset_mtx);
 }
