@@ -3,8 +3,11 @@
 #
 # Output: dist/filmcomp_<version>_amd64.deb
 #
-# Run as user (no sudo needed). Builds inside the existing aroio6
-# docker container so the host doesn't need libjack/glfw dev pkgs.
+# Run as user (no sudo needed). Builds inside a debian:12 (bookworm,
+# glibc 2.36) docker container so the host needs no libjack/glfw dev
+# pkgs and the binary stays portable: glibc 2.36 runs on bookworm and
+# every newer Debian/Ubuntu (convolver, muaddib, ...). Override with
+# DOCKER_IMAGE=... if you need a different base.
 # If you have the dev packages installed natively, you can also
 # invoke this directly outside Docker:  BUILD_NATIVE=1 ./build-deb.sh
 set -euo pipefail
@@ -27,8 +30,9 @@ if [[ "${BUILD_NATIVE:-0}" == "1" ]]; then
     make clean
     make
 else
-    # Use the aroio6 build container with apt-installed deps.
-    DOCKER_IMAGE="${DOCKER_IMAGE:-aroio6-builder}"
+    # debian:12 = glibc 2.36 baseline → portable binary. Deps apt-installed
+    # in the throwaway container; image is pulled on first run.
+    DOCKER_IMAGE="${DOCKER_IMAGE:-debian:12}"
     docker run --rm -u 0:0 \
         -v "$PKGROOT":/build \
         "$DOCKER_IMAGE" bash -c "
@@ -91,7 +95,7 @@ else
     # have one (debian/ubuntu hosts usually do; arch / fedora don't).
     docker run --rm -u 0:0 \
         -v "$PKGROOT":/build \
-        "${DOCKER_IMAGE:-aroio6-builder}" bash -c "
+        "${DOCKER_IMAGE:-debian:12}" bash -c "
             cd /build &&
             dpkg-deb --build --root-owner-group dist/stage $(basename "$DEB") &&
             mv $(basename "$DEB") dist/ &&
