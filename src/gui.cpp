@@ -736,6 +736,9 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "engine_start failed (JACK not running?)\n");
         return 1;
     }
+    // Seed the built-in stock presets first; state_load() then overrides
+    // any the user has saved under the same name (their copy wins).
+    engine_named_seed_factory();
     state_load(opts.state_path);
 
     // Architecture is fixed to zonal v2 (Classic/v1 retired) and the Dual
@@ -849,7 +852,6 @@ int main(int argc, char **argv) {
 
         const int arch_mode = 2;   // fixed: Classic/v1 retired, v2 only
         int det_mode  = engine_get_param_i(PARAM_DETECTOR_MODE);
-        int active    = engine_preset_active();
 
         // ===== Header =================================================
         {
@@ -866,33 +868,21 @@ int main(int argc, char **argv) {
 
             ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
 
-            // Unified preset dropdown — Factory (LOW/MID/HIGH) + Eigene
-            // (named). Mirrors the aroio6 web UI's #dyn-preset-select.
-            // Copy out of the engine's shared static buffer right away.
+            // Preset dropdown — the built-in stock presets (90ies /
+            // Modern x Low/Mid/Hi) plus any user-saved named presets.
+            // The generic factory LOW/MID/HIGH slots stay in the engine
+            // and OSC API but are intentionally NOT listed here (kept the
+            // list from being a 9-entry jumble). Copy out of the engine's
+            // shared static buffer right away.
             std::string named_active = engine_named_active();
             bool has_named_active = !named_active.empty();
-            const char *fnames[PRESET__COUNT] = { "LOW", "MID", "HIGH" };
 
-            // Current combo label reflects engine state.
             char preview[ENGINE_NAME_LEN + 16];
-            if (has_named_active)
-                std::snprintf(preview, sizeof(preview), "%s", named_active.c_str());
-            else if (active >= 0 && active < PRESET__COUNT)
-                std::snprintf(preview, sizeof(preview), "%s", fnames[active]);
-            else
-                std::snprintf(preview, sizeof(preview), "%s", "—");
+            std::snprintf(preview, sizeof(preview), "%s",
+                          has_named_active ? named_active.c_str() : "—");
 
             ImGui::SetNextItemWidth(150);
             if (ImGui::BeginCombo("##fc-preset", preview)) {
-                ImGui::TextDisabled("── Factory ──");
-                for (int i = 0; i < PRESET__COUNT; i++) {
-                    bool sel = (!has_named_active && active == i);
-                    if (ImGui::Selectable(fnames[i], sel)) {
-                        engine_preset_apply((engine_preset_slot_t)i);
-                        mark_dirty();
-                    }
-                }
-                ImGui::TextDisabled("── Eigene ──");
                 int nn = engine_named_count();
                 if (nn == 0) {
                     ImGui::TextDisabled("  — keine —");

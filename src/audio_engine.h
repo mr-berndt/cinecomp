@@ -156,6 +156,11 @@ void engine_named_set_active(const char *name);    /* NULL/"" clears */
  * buffer (no live-param snapshot). Used by the state.ini loader. */
 void engine_named_set(const char *name, const engine_preset_t *in);
 
+/* Seed the built-in stock presets (90ies/Modern x Low/Mid/Hi). Only
+ * adds names not already present, so it never clobbers a user copy.
+ * Call before loading state so the user's state.ini wins. */
+void engine_named_seed_factory(void);
+
 #ifdef __cplusplus
 }
 #endif

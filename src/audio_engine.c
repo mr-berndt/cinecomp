@@ -1586,6 +1586,107 @@ void engine_named_set(const char *name, const engine_preset_t *in) {
 	pthread_mutex_unlock(&named_mtx);
 }
 
+/* ---- Built-in stock named presets ------------------------------------
+ * Two era families x three intensities, cinema-tuned by Nicola
+ * (2026-05-17) and sanity-checked. The era axis lives in the zone map:
+ *   90ies  — louder atmo (atmo_thr -39.2) + hotter dialogue (dlg_thr
+ *            ~-7.7), smaller perceived spread.
+ *   Modern — quieter atmo (atmo_thr -45.3) + lower dialogue (-10.5),
+ *            zones spread far apart.
+ * The Low/Mid/Hi ladder is a pure intensity axis: atmo lift 8/12/20,
+ * dialog lift 4/8/10, makeup -4/-8/-10, duck off/on/on. All v2 + Peak.
+ * noise_floor is normalised to the fixed -80 guard. Seeded only when a
+ * name is absent (engine_named_seed_factory), so a user's own state.ini
+ * copy always wins. Names are kept verbatim; the dropdown sorts them
+ * alphabetically (… Hi, … Low, … Mid). */
+static const named_preset_t factory_named[] = {
+	{ "90ies Low", { .f = {
+		[PARAM_THRESHOLD]=-10, [PARAM_RATIO]=6, [PARAM_ATTACK_MS]=5,
+		[PARAM_RELEASE_MS]=800, [PARAM_HOLD_MS]=0, [PARAM_KNEE_DB]=16.5f,
+		[PARAM_MAKEUP_DB]=-4, [PARAM_WET_DRY]=1, [PARAM_RMS_WIN_MS]=50,
+		[PARAM_SC_HPF_HZ]=20, [PARAM_LOOKAHEAD_MS]=20, [PARAM_MAX_GAIN_DB]=18.5f,
+		[PARAM_DOWN_THRESHOLD]=-6.7f, [PARAM_DOWN_RATIO]=2.1f,
+		[PARAM_ATMO_THRESHOLD]=-39.2f, [PARAM_ATMO_MAX_GAIN]=8, [PARAM_ATMO_KNEE]=14.9f,
+		[PARAM_DIALOG_THRESHOLD]=-7.6f, [PARAM_DIALOG_MAX_GAIN]=4, [PARAM_DIALOG_KNEE]=20.2f,
+		[PARAM_NOISE_FLOOR_DB]=-80, [PARAM_NOISE_KNEE_DB]=10.5f,
+		[PARAM_UPWARD_ATTACK_MS]=451, [PARAM_UPWARD_RELEASE_MS]=20,
+		[PARAM_DUCK_ATTACK_MS]=9, [PARAM_DUCK_RELEASE_MS]=51,
+	}, .detector_mode=1, .downward_en=0, .architecture_mode=2 } },
+	{ "90ies Mid", { .f = {
+		[PARAM_THRESHOLD]=-10, [PARAM_RATIO]=6, [PARAM_ATTACK_MS]=5,
+		[PARAM_RELEASE_MS]=800, [PARAM_HOLD_MS]=0, [PARAM_KNEE_DB]=16.5f,
+		[PARAM_MAKEUP_DB]=-7.8f, [PARAM_WET_DRY]=1, [PARAM_RMS_WIN_MS]=50,
+		[PARAM_SC_HPF_HZ]=20, [PARAM_LOOKAHEAD_MS]=20, [PARAM_MAX_GAIN_DB]=18.5f,
+		[PARAM_DOWN_THRESHOLD]=-6.7f, [PARAM_DOWN_RATIO]=2.1f,
+		[PARAM_ATMO_THRESHOLD]=-39.2f, [PARAM_ATMO_MAX_GAIN]=12, [PARAM_ATMO_KNEE]=14.9f,
+		[PARAM_DIALOG_THRESHOLD]=-7.6f, [PARAM_DIALOG_MAX_GAIN]=8, [PARAM_DIALOG_KNEE]=20.2f,
+		[PARAM_NOISE_FLOOR_DB]=-80, [PARAM_NOISE_KNEE_DB]=10.5f,
+		[PARAM_UPWARD_ATTACK_MS]=451, [PARAM_UPWARD_RELEASE_MS]=20,
+		[PARAM_DUCK_ATTACK_MS]=9, [PARAM_DUCK_RELEASE_MS]=51,
+	}, .detector_mode=1, .downward_en=1, .architecture_mode=2 } },
+	{ "90ies Hi", { .f = {
+		[PARAM_THRESHOLD]=-10, [PARAM_RATIO]=6, [PARAM_ATTACK_MS]=5,
+		[PARAM_RELEASE_MS]=800, [PARAM_HOLD_MS]=0, [PARAM_KNEE_DB]=16.5f,
+		[PARAM_MAKEUP_DB]=-10, [PARAM_WET_DRY]=1, [PARAM_RMS_WIN_MS]=54,
+		[PARAM_SC_HPF_HZ]=20, [PARAM_LOOKAHEAD_MS]=20, [PARAM_MAX_GAIN_DB]=18.5f,
+		[PARAM_DOWN_THRESHOLD]=-8, [PARAM_DOWN_RATIO]=2.1f,
+		[PARAM_ATMO_THRESHOLD]=-39.2f, [PARAM_ATMO_MAX_GAIN]=20, [PARAM_ATMO_KNEE]=14.9f,
+		[PARAM_DIALOG_THRESHOLD]=-7.9f, [PARAM_DIALOG_MAX_GAIN]=10, [PARAM_DIALOG_KNEE]=12.3f,
+		[PARAM_NOISE_FLOOR_DB]=-80, [PARAM_NOISE_KNEE_DB]=10.5f,
+		[PARAM_UPWARD_ATTACK_MS]=451, [PARAM_UPWARD_RELEASE_MS]=20,
+		[PARAM_DUCK_ATTACK_MS]=9, [PARAM_DUCK_RELEASE_MS]=51,
+	}, .detector_mode=1, .downward_en=1, .architecture_mode=2 } },
+	{ "Modern Low", { .f = {
+		[PARAM_THRESHOLD]=-10, [PARAM_RATIO]=6, [PARAM_ATTACK_MS]=5,
+		[PARAM_RELEASE_MS]=800, [PARAM_HOLD_MS]=0, [PARAM_KNEE_DB]=16.5f,
+		[PARAM_MAKEUP_DB]=-4, [PARAM_WET_DRY]=1, [PARAM_RMS_WIN_MS]=54,
+		[PARAM_SC_HPF_HZ]=20, [PARAM_LOOKAHEAD_MS]=20, [PARAM_MAX_GAIN_DB]=18.5f,
+		[PARAM_DOWN_THRESHOLD]=-8, [PARAM_DOWN_RATIO]=1.4f,
+		[PARAM_ATMO_THRESHOLD]=-45.3f, [PARAM_ATMO_MAX_GAIN]=8, [PARAM_ATMO_KNEE]=14.9f,
+		[PARAM_DIALOG_THRESHOLD]=-10.5f, [PARAM_DIALOG_MAX_GAIN]=4, [PARAM_DIALOG_KNEE]=12.3f,
+		[PARAM_NOISE_FLOOR_DB]=-80, [PARAM_NOISE_KNEE_DB]=10.5f,
+		[PARAM_UPWARD_ATTACK_MS]=451, [PARAM_UPWARD_RELEASE_MS]=20,
+		[PARAM_DUCK_ATTACK_MS]=9, [PARAM_DUCK_RELEASE_MS]=51,
+	}, .detector_mode=1, .downward_en=0, .architecture_mode=2 } },
+	{ "Modern Mid", { .f = {
+		[PARAM_THRESHOLD]=-10, [PARAM_RATIO]=6, [PARAM_ATTACK_MS]=5,
+		[PARAM_RELEASE_MS]=800, [PARAM_HOLD_MS]=0, [PARAM_KNEE_DB]=16.5f,
+		[PARAM_MAKEUP_DB]=-8, [PARAM_WET_DRY]=1, [PARAM_RMS_WIN_MS]=54,
+		[PARAM_SC_HPF_HZ]=20, [PARAM_LOOKAHEAD_MS]=20, [PARAM_MAX_GAIN_DB]=18.5f,
+		[PARAM_DOWN_THRESHOLD]=-8, [PARAM_DOWN_RATIO]=1.4f,
+		[PARAM_ATMO_THRESHOLD]=-45.3f, [PARAM_ATMO_MAX_GAIN]=12, [PARAM_ATMO_KNEE]=14.9f,
+		[PARAM_DIALOG_THRESHOLD]=-10.5f, [PARAM_DIALOG_MAX_GAIN]=8, [PARAM_DIALOG_KNEE]=12.3f,
+		[PARAM_NOISE_FLOOR_DB]=-80, [PARAM_NOISE_KNEE_DB]=10.5f,
+		[PARAM_UPWARD_ATTACK_MS]=451, [PARAM_UPWARD_RELEASE_MS]=20,
+		[PARAM_DUCK_ATTACK_MS]=9, [PARAM_DUCK_RELEASE_MS]=51,
+	}, .detector_mode=1, .downward_en=1, .architecture_mode=2 } },
+	{ "Modern Hi", { .f = {
+		[PARAM_THRESHOLD]=-10, [PARAM_RATIO]=6, [PARAM_ATTACK_MS]=5,
+		[PARAM_RELEASE_MS]=800, [PARAM_HOLD_MS]=0, [PARAM_KNEE_DB]=16.5f,
+		[PARAM_MAKEUP_DB]=-10, [PARAM_WET_DRY]=1, [PARAM_RMS_WIN_MS]=54,
+		[PARAM_SC_HPF_HZ]=20, [PARAM_LOOKAHEAD_MS]=20, [PARAM_MAX_GAIN_DB]=18.5f,
+		[PARAM_DOWN_THRESHOLD]=-8, [PARAM_DOWN_RATIO]=2.1f,
+		[PARAM_ATMO_THRESHOLD]=-45.3f, [PARAM_ATMO_MAX_GAIN]=20, [PARAM_ATMO_KNEE]=14.9f,
+		[PARAM_DIALOG_THRESHOLD]=-10.5f, [PARAM_DIALOG_MAX_GAIN]=10, [PARAM_DIALOG_KNEE]=12.3f,
+		[PARAM_NOISE_FLOOR_DB]=-80, [PARAM_NOISE_KNEE_DB]=10.5f,
+		[PARAM_UPWARD_ATTACK_MS]=451, [PARAM_UPWARD_RELEASE_MS]=20,
+		[PARAM_DUCK_ATTACK_MS]=9, [PARAM_DUCK_RELEASE_MS]=51,
+	}, .detector_mode=1, .downward_en=1, .architecture_mode=2 } },
+};
+
+/* Install the built-in stock presets. Only inserts a name that is not
+ * already present, so this is idempotent and never clobbers a user's
+ * own copy (call before state_load to get factory-default semantics:
+ * stock seeded first, the user's state.ini then overrides). */
+void engine_named_seed_factory(void) {
+	size_t n = sizeof(factory_named) / sizeof(factory_named[0]);
+	for (size_t i = 0; i < n; i++) {
+		engine_preset_t tmp;
+		if (engine_named_get(factory_named[i].name, &tmp) != 0)
+			engine_named_set(factory_named[i].name, &factory_named[i].p);
+	}
+}
+
 int engine_named_delete(const char *name) {
 	if (!name || !*name) return 0;
 	pthread_mutex_lock(&named_mtx);
