@@ -1,5 +1,7 @@
 # filmcomp
 
+![filmcomp — native JACK GUI: gain-vs-side-chain plateau curve, 8-channel in/out peak meters, zonal-v2 controls](filmcomp.png)
+
 A zone-aware compressor for watching films at home without waking the
 neighbours — and without the dull, lifeless sound that ordinary
 compression leaves behind when used on a sum signal.
