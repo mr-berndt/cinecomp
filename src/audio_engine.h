@@ -1,5 +1,5 @@
 /*
- * audio_engine.h — public interface to the filmcomp DSP/JACK engine for
+ * audio_engine.h — public interface to the cinecomp DSP/JACK engine for
  * the standalone GUI build.
  *
  * The engine is the same DSP body as the aroio6-Buildroot package
@@ -12,11 +12,11 @@
  *
  * OSC server inside the engine runs unchanged, so the standalone binary
  * keeps OSC remote-control parity with the Buildroot variant (same
- * /filmcomp/* paths, including the v2 zonal architecture knobs).
+ * /cinecomp/* paths, including the v2 zonal architecture knobs).
  */
 
-#ifndef FILMCOMP_AUDIO_ENGINE_H
-#define FILMCOMP_AUDIO_ENGINE_H
+#ifndef CINECOMP_AUDIO_ENGINE_H
+#define CINECOMP_AUDIO_ENGINE_H
 
 #ifdef __cplusplus
 extern "C" {
@@ -75,9 +75,9 @@ typedef struct {
     float gain_db;                      /* currently applied upward gain */
 } engine_meters_t;
 
-/* Engine lifecycle. jack_name is the JACK client name (e.g. "filmcomp"),
+/* Engine lifecycle. jack_name is the JACK client name (e.g. "cinecomp"),
  * osc_port the UDP port for the OSC server. Both can be 0/NULL to use
- * defaults ("filmcomp", 14041). Returns 0 on success. */
+ * defaults ("cinecomp", 14041). Returns 0 on success. */
 int  engine_start(const char *jack_name, int osc_port);
 void engine_stop(void);
 unsigned engine_sample_rate(void);
@@ -165,4 +165,4 @@ void engine_named_seed_factory(void);
 }
 #endif
 
-#endif /* FILMCOMP_AUDIO_ENGINE_H */
+#endif /* CINECOMP_AUDIO_ENGINE_H */

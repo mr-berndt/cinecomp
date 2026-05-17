@@ -1,5 +1,5 @@
 /*
- * filmcomp standalone — Dear ImGui GUI front-end.
+ * cinecomp standalone — Dear ImGui GUI front-end.
  *
  * 2x2 main layout (v2 architecture), matching the aroio6 web UI:
  *
@@ -47,7 +47,7 @@
 // State file (small INI parser — key=value, [section] headers, # comments)
 
 struct AppOpts {
-    std::string jack_name = "filmcomp";
+    std::string jack_name = "cinecomp";
     int         osc_port  = 14041;
     std::string state_path;
 };
@@ -65,7 +65,7 @@ static std::string default_state_path() {
         }
         base = std::string(home) + "/.config";
     }
-    base += "/filmcomp";
+    base += "/cinecomp";
     mkdir(base.c_str(), 0755);
     return base + "/state.ini";
 }
@@ -107,7 +107,7 @@ static const int N_FKEYS = sizeof(FKEYS) / sizeof(FKEYS[0]);
 static void state_save(const std::string &path) {
     std::ofstream f(path);
     if (!f) return;
-    f << "# filmcomp state - auto-generated\n";
+    f << "# cinecomp state - auto-generated\n";
     f << "[live]\n";
     for (auto &m : FKEYS) f << m.key << " = " << engine_get_param_f(m.id) << "\n";
     f << "detector_mode     = " << engine_get_param_i(PARAM_DETECTOR_MODE)     << "\n";
@@ -752,7 +752,7 @@ int main(int argc, char **argv) {
     if (!glfwInit()) { engine_stop(); return 1; }
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
-    GLFWwindow *win = glfwCreateWindow(1280, 760, "filmcomp", nullptr, nullptr);
+    GLFWwindow *win = glfwCreateWindow(1280, 760, "cinecomp", nullptr, nullptr);
     if (!win) { glfwTerminate(); engine_stop(); return 1; }
     glfwMakeContextCurrent(win);
     glfwSwapInterval(1);
@@ -855,7 +855,7 @@ int main(int argc, char **argv) {
 
         // ===== Header =================================================
         {
-            ImGui::TextColored(clr::amber, "filmcomp");
+            ImGui::TextColored(clr::amber, "cinecomp");
             ImGui::SameLine();
             ImGui::TextDisabled("· upward compressor (zonal v2)");
             ImGui::SameLine();

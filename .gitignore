@@ -1,4 +1,4 @@
-filmcomp
+cinecomp
 *.o
 dist/
 .ccache/

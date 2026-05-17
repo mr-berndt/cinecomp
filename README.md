@@ -1,6 +1,6 @@
-# filmcomp
+# cinecomp
 
-![filmcomp — native JACK GUI: gain-vs-side-chain plateau curve, 8-channel in/out peak meters, zonal-v2 controls](filmcomp.png)
+![cinecomp — native JACK GUI: gain-vs-side-chain plateau curve, 8-channel in/out peak meters, zonal-v2 controls](cinecomp.png)
 
 A zone-aware compressor for watching films at home without waking the
 neighbours — and without the dull, lifeless sound that ordinary
@@ -51,7 +51,7 @@ these zones much further apart.
 To get *transparent* compression — compression you don't notice — you
 need something that changes its behaviour depending on which zone the
 signal is currently in. I tried cascading classic compressors; that was
-not transparent. filmcomp instead shapes a separate, smooth gain plateau
+not transparent. cinecomp instead shapes a separate, smooth gain plateau
 for each zone (band-shaped weighting), with soft knees between them.
 
 The goal: lift the atmosphere until it's nicely noticeable, lift
@@ -61,7 +61,7 @@ volume a dozen times per film.
 
 I never liked the idea of compressing everything that "sticks out":
 used on a sum, that inevitably kills transients and becomes audible.
-So filmcomp uses **upward compression** for everything below the
+So cinecomp uses **upward compression** for everything below the
 top-end threshold. Above it there is an optional **duck** stage — a
 classic downward compressor — for the rare true spikes, but it has very
 little to do, so we can run it at very gentle settings that still leave
@@ -128,7 +128,7 @@ sudo dnf install gcc-c++ make pkgconf jack-audio-connection-kit-devel glfw-devel
 make
 ```
 
-Output: a single self-contained ~900 KB ELF binary, `filmcomp`, in the
+Output: a single self-contained ~900 KB ELF binary, `cinecomp`, in the
 project root.
 
 **Build a `.deb`** (in a throwaway `debian:12` container, so the host
@@ -136,7 +136,7 @@ needs no dev packages and the binary stays glibc-portable — glibc 2.36
 runs on bookworm and every newer Debian/Ubuntu):
 
 ```sh
-bash build-deb.sh            # → dist/filmcomp_<version>_amd64.deb
+bash build-deb.sh            # → dist/cinecomp_<version>_amd64.deb
 DOCKER_IMAGE=… bash build-deb.sh   # override base image
 BUILD_NATIVE=1 bash build-deb.sh   # build on the host instead of Docker
 ```
@@ -144,16 +144,16 @@ BUILD_NATIVE=1 bash build-deb.sh   # build on the host instead of Docker
 ## Run
 
 ```sh
-./filmcomp                              # defaults
-./filmcomp --name comp2 --osc 14042     # second instance
-./filmcomp --state /path/to/preset.ini  # custom preset file
+./cinecomp                              # defaults
+./cinecomp --name comp2 --osc 14042     # second instance
+./cinecomp --state /path/to/preset.ini  # custom preset file
 ```
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--name <s>` | `filmcomp` | JACK client name |
+| `--name <s>` | `cinecomp` | JACK client name |
 | `--osc <port>` | `14041` | OSC server port (UDP) |
-| `--state <path>` | `$XDG_CONFIG_HOME/filmcomp/state.ini` | persistence |
+| `--state <path>` | `$XDG_CONFIG_HOME/cinecomp/state.ini` | persistence |
 
 Settings auto-save: ~1 s debounce on slider changes, plus a final save
 on exit. The standalone build **processes by default** (bypass off) —
@@ -162,14 +162,14 @@ delay-matched pass-through.
 
 ## Architecture
 
-filmcomp uses a single topology: **zonal v2** — band-shaped gain
+cinecomp uses a single topology: **zonal v2** — band-shaped gain
 plateaus per zone, an asymmetric upward envelope, and a soft-knee duck
 on top. That is the whole product; there is nothing to pick.
 
 Two earlier prototypes — *Classic* (one upward stage + duck) and
 *Zonal v1* (summed atmo + dialogue stages + duck) — are retired. They
 are no longer reachable from the GUI; the engine still accepts the old
-`/filmcomp/architecture` OSC value only so that legacy state files keep
+`/cinecomp/architecture` OSC value only so that legacy state files keep
 loading.
 
 The v2 plateau topology is verified on hard cinema test scenes (the
@@ -186,7 +186,7 @@ in_L  in_R  in_C  in_LFE  in_LS  in_RS  in_RBL  in_RBR
 out_L out_R out_C out_LFE out_LS out_RS out_RBL out_RBR
 ```
 
-**No per-layout configuration.** filmcomp is layout-agnostic via smooth
+**No per-layout configuration.** cinecomp is layout-agnostic via smooth
 per-channel weights: silent ports are automatically kept out of the
 detection, so the *same* settings work unchanged from plain 2.0 stereo
 through 5.1 right up to 7.1 — you never tell it which layout you have.
@@ -208,31 +208,31 @@ Full UDP OSC API (same paths as the Aroio embedded-device variant of
 this engine). Main controls:
 
 ```
-/filmcomp/bypass i             — 0/1
-/filmcomp/detector i           — 0=RMS, 1=Peak   (Dual retired)
-/filmcomp/architecture i       — legacy/compat only; engine runs v2
+/cinecomp/bypass i             — 0/1
+/cinecomp/detector i           — 0=RMS, 1=Peak   (Dual retired)
+/cinecomp/architecture i       — legacy/compat only; engine runs v2
 
 # Zonal stages (the live topology)
-/filmcomp/atmo/threshold f     /filmcomp/atmo/max_gain f    /filmcomp/atmo/knee f
-/filmcomp/dialog/threshold f   /filmcomp/dialog/max_gain f  /filmcomp/dialog/knee f
-/filmcomp/upward/attack_ms f   /filmcomp/upward/release_ms f
-/filmcomp/duck/attack_ms f     /filmcomp/duck/release_ms f
+/cinecomp/atmo/threshold f     /cinecomp/atmo/max_gain f    /cinecomp/atmo/knee f
+/cinecomp/dialog/threshold f   /cinecomp/dialog/max_gain f  /cinecomp/dialog/knee f
+/cinecomp/upward/attack_ms f   /cinecomp/upward/release_ms f
+/cinecomp/duck/attack_ms f     /cinecomp/duck/release_ms f
 
 # Legacy classic-stage paths — still accepted, but ignored under v2
-/filmcomp/threshold f   /filmcomp/ratio f   /filmcomp/max_gain f
+/cinecomp/threshold f   /cinecomp/ratio f   /cinecomp/max_gain f
 # Fixed internal guards — accepted for compat, not user-facing
-/filmcomp/noise/floor f        /filmcomp/noise/knee f
+/cinecomp/noise/floor f        /cinecomp/noise/knee f
 
 # Presets
-/filmcomp/preset/select i      — 0=LOW, 1=MID, 2=HIGH
-/filmcomp/preset/save i        — save current params to slot N
-/filmcomp/preset/reset i       — reset slot N to factory defaults
-/filmcomp/named/save s         /filmcomp/named/apply s   /filmcomp/named/delete s
+/cinecomp/preset/select i      — 0=LOW, 1=MID, 2=HIGH
+/cinecomp/preset/save i        — save current params to slot N
+/cinecomp/preset/reset i       — reset slot N to factory defaults
+/cinecomp/named/save s         /cinecomp/named/apply s   /cinecomp/named/delete s
 
 # Meter subscribe
-/filmcomp/subscribe            — enable UDP meter broadcast
-/filmcomp/unsubscribe
-/filmcomp/get
+/cinecomp/subscribe            — enable UDP meter broadcast
+/cinecomp/unsubscribe
+/cinecomp/get
 ```
 
 Full list: see the doc comment at the top of `src/audio_engine.c`.
@@ -261,6 +261,6 @@ are persisted to the state file.
 
 ## Licenses
 
-- filmcomp code: proprietary (Abacus Electronics)
+- cinecomp code: proprietary (Abacus Electronics)
 - Dear ImGui: MIT — `vendor/imgui/LICENSE.txt`
 - GLFW: zlib/libpng — distribution package

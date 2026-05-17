@@ -1,5 +1,5 @@
 /*
- * filmcomp — Upward / parallel compressor for film playback.
+ * cinecomp — Upward / parallel compressor for film playback.
  *
  * Standalone-app DSP body. Mirrors the aroio6-Buildroot package
  * `aroio_filmcomp` (Aroio platform variant of the same engine) on a
@@ -19,47 +19,47 @@
  *
  * OSC API (UDP, default port 14041):
  *   in (classic + global):
- *     /filmcomp/threshold f          — dBFS for SC
- *     /filmcomp/ratio f              — 1.0 .. 20.0 (upward)
- *     /filmcomp/attack_ms f          — how fast boost ramps up
- *     /filmcomp/release_ms f         — how fast boost decays
- *     /filmcomp/hold_ms f            — anti-pump hold between A and R
- *     /filmcomp/knee_db f            — soft-knee width (duck stage in zonal)
- *     /filmcomp/makeup_db f          — post-comp static gain
- *     /filmcomp/wet_dry f            — 0.0=dry .. 1.0=full comp
- *     /filmcomp/rms_win_ms f         — detector smoothing time
- *     /filmcomp/sc_hpf_hz f          — side-chain HPF corner
- *     /filmcomp/lookahead_ms f       — audio path delay (anti-overshoot)
- *     /filmcomp/max_gain f           — hard cap for upward boost (dB, classic)
- *     /filmcomp/detector i           — 0=RMS, 1=Peak, 2=Dual (zonal-only)
- *     /filmcomp/downward/enable i    — 0/1
- *     /filmcomp/downward/threshold f
- *     /filmcomp/downward/ratio f
- *     /filmcomp/bypass i             — 0/1 (default 1 at boot)
+ *     /cinecomp/threshold f          — dBFS for SC
+ *     /cinecomp/ratio f              — 1.0 .. 20.0 (upward)
+ *     /cinecomp/attack_ms f          — how fast boost ramps up
+ *     /cinecomp/release_ms f         — how fast boost decays
+ *     /cinecomp/hold_ms f            — anti-pump hold between A and R
+ *     /cinecomp/knee_db f            — soft-knee width (duck stage in zonal)
+ *     /cinecomp/makeup_db f          — post-comp static gain
+ *     /cinecomp/wet_dry f            — 0.0=dry .. 1.0=full comp
+ *     /cinecomp/rms_win_ms f         — detector smoothing time
+ *     /cinecomp/sc_hpf_hz f          — side-chain HPF corner
+ *     /cinecomp/lookahead_ms f       — audio path delay (anti-overshoot)
+ *     /cinecomp/max_gain f           — hard cap for upward boost (dB, classic)
+ *     /cinecomp/detector i           — 0=RMS, 1=Peak, 2=Dual (zonal-only)
+ *     /cinecomp/downward/enable i    — 0/1
+ *     /cinecomp/downward/threshold f
+ *     /cinecomp/downward/ratio f
+ *     /cinecomp/bypass i             — 0/1 (default 1 at boot)
  *   in (zonal architecture):
- *     /filmcomp/architecture i
- *     /filmcomp/atmo/threshold f     /filmcomp/atmo/max_gain f    /filmcomp/atmo/knee f
- *     /filmcomp/dialog/threshold f   /filmcomp/dialog/max_gain f  /filmcomp/dialog/knee f
- *     /filmcomp/noise/floor f        /filmcomp/noise/knee f
- *     /filmcomp/upward/attack_ms f   /filmcomp/upward/release_ms f
- *     /filmcomp/duck/attack_ms f     /filmcomp/duck/release_ms f
+ *     /cinecomp/architecture i
+ *     /cinecomp/atmo/threshold f     /cinecomp/atmo/max_gain f    /cinecomp/atmo/knee f
+ *     /cinecomp/dialog/threshold f   /cinecomp/dialog/max_gain f  /cinecomp/dialog/knee f
+ *     /cinecomp/noise/floor f        /cinecomp/noise/knee f
+ *     /cinecomp/upward/attack_ms f   /cinecomp/upward/release_ms f
+ *     /cinecomp/duck/attack_ms f     /cinecomp/duck/release_ms f
  *   in (preset control):
- *     /filmcomp/preset/select i      — apply preset N (0=low 1=mid 2=high)
- *     /filmcomp/preset/save   i      — save current params to preset N
- *     /filmcomp/preset/reset  i      — reset preset N to factory defaults
- *     /filmcomp/named/save   s       — save live params under name S
- *     /filmcomp/named/apply  s       — apply named preset S
- *     /filmcomp/named/delete s       — delete named preset S
+ *     /cinecomp/preset/select i      — apply preset N (0=low 1=mid 2=high)
+ *     /cinecomp/preset/save   i      — save current params to preset N
+ *     /cinecomp/preset/reset  i      — reset preset N to factory defaults
+ *     /cinecomp/named/save   s       — save live params under name S
+ *     /cinecomp/named/apply  s       — apply named preset S
+ *     /cinecomp/named/delete s       — delete named preset S
  *   in (meter subscription):
- *     /filmcomp/subscribe            — sender added to broadcast list
- *     /filmcomp/unsubscribe          — sender removed
- *     /filmcomp/get                  — request current state
+ *     /cinecomp/subscribe            — sender added to broadcast list
+ *     /cinecomp/unsubscribe          — sender removed
+ *     /cinecomp/get                  — request current state
  *   out (broadcast to subscribers, ~20 Hz):
- *     /filmcomp/peaks_in ff…f        — 8 peak dBFS per input channel
- *     /filmcomp/peaks_out ff…f       — 8 peak dBFS per output channel
- *     /filmcomp/weights ff…f         — 8 channel weights 0..1 (activity)
- *     /filmcomp/sc_db f              — current side-chain RMS dB
- *     /filmcomp/gain_db f            — current applied gain (before makeup)
+ *     /cinecomp/peaks_in ff…f        — 8 peak dBFS per input channel
+ *     /cinecomp/peaks_out ff…f       — 8 peak dBFS per output channel
+ *     /cinecomp/weights ff…f         — 8 channel weights 0..1 (activity)
+ *     /cinecomp/sc_db f              — current side-chain RMS dB
+ *     /cinecomp/gain_db f            — current applied gain (before makeup)
  */
 
 #define _GNU_SOURCE
@@ -117,7 +117,7 @@
 /* ----------------------------- Shared state ----------------------------- */
 
 static int osc_port = 14041;
-static const char *jack_name = "filmcomp";
+static const char *jack_name = "cinecomp";
 static int verbose = 0;
 
 static jack_client_t *client;
@@ -800,49 +800,49 @@ static void broadcast_meters(void) {
 
 	pthread_mutex_lock(&subscriber_mtx);
 	for (int s = 0; s < subscriber_count; s++) {
-		send_eight_floats(&subscribers[s], "/filmcomp/peaks_in",  pin);
-		send_eight_floats(&subscribers[s], "/filmcomp/peaks_out", pout);
-		send_eight_floats(&subscribers[s], "/filmcomp/weights",   wts);
-		send_one_float(&subscribers[s], "/filmcomp/sc_db",   sc_db);
-		send_one_float(&subscribers[s], "/filmcomp/gain_db", gain_db);
+		send_eight_floats(&subscribers[s], "/cinecomp/peaks_in",  pin);
+		send_eight_floats(&subscribers[s], "/cinecomp/peaks_out", pout);
+		send_eight_floats(&subscribers[s], "/cinecomp/weights",   wts);
+		send_one_float(&subscribers[s], "/cinecomp/sc_db",   sc_db);
+		send_one_float(&subscribers[s], "/cinecomp/gain_db", gain_db);
 	}
 	pthread_mutex_unlock(&subscriber_mtx);
 }
 
 static void send_state(struct sockaddr_in *dst) {
-	send_one_float(dst, "/filmcomp/threshold",  atomic_load_explicit(&p_threshold_db, memory_order_relaxed));
-	send_one_float(dst, "/filmcomp/ratio",      atomic_load_explicit(&p_ratio,        memory_order_relaxed));
-	send_one_float(dst, "/filmcomp/attack_ms",  atomic_load_explicit(&p_attack_ms,    memory_order_relaxed));
-	send_one_float(dst, "/filmcomp/release_ms", atomic_load_explicit(&p_release_ms,   memory_order_relaxed));
-	send_one_float(dst, "/filmcomp/hold_ms",    atomic_load_explicit(&p_hold_ms,      memory_order_relaxed));
-	send_one_float(dst, "/filmcomp/knee_db",    atomic_load_explicit(&p_knee_db,      memory_order_relaxed));
-	send_one_float(dst, "/filmcomp/makeup_db",  atomic_load_explicit(&p_makeup_db,    memory_order_relaxed));
-	send_one_float(dst, "/filmcomp/wet_dry",    atomic_load_explicit(&p_wet_dry,      memory_order_relaxed));
-	send_one_float(dst, "/filmcomp/rms_win_ms", atomic_load_explicit(&p_rms_win_ms,   memory_order_relaxed));
-	send_one_float(dst, "/filmcomp/sc_hpf_hz",  atomic_load_explicit(&p_sc_hpf_hz,    memory_order_relaxed));
-	send_one_float(dst, "/filmcomp/lookahead_ms", atomic_load_explicit(&p_lookahead_ms, memory_order_relaxed));
-	send_one_float(dst, "/filmcomp/max_gain",   atomic_load_explicit(&p_max_gain_db,  memory_order_relaxed));
-	send_one_int  (dst, "/filmcomp/detector",   atomic_load_explicit(&p_detector_mode, memory_order_relaxed));
-	send_one_int  (dst, "/filmcomp/downward/enable",   atomic_load_explicit(&p_downward_en,    memory_order_relaxed));
-	send_one_float(dst, "/filmcomp/downward/threshold", atomic_load_explicit(&p_down_threshold, memory_order_relaxed));
-	send_one_float(dst, "/filmcomp/downward/ratio",     atomic_load_explicit(&p_down_ratio,     memory_order_relaxed));
-	send_one_int  (dst, "/filmcomp/bypass",     atomic_load_explicit(&p_bypass,       memory_order_relaxed));
-	send_one_int  (dst, "/filmcomp/preset/active", engine_preset_active());
+	send_one_float(dst, "/cinecomp/threshold",  atomic_load_explicit(&p_threshold_db, memory_order_relaxed));
+	send_one_float(dst, "/cinecomp/ratio",      atomic_load_explicit(&p_ratio,        memory_order_relaxed));
+	send_one_float(dst, "/cinecomp/attack_ms",  atomic_load_explicit(&p_attack_ms,    memory_order_relaxed));
+	send_one_float(dst, "/cinecomp/release_ms", atomic_load_explicit(&p_release_ms,   memory_order_relaxed));
+	send_one_float(dst, "/cinecomp/hold_ms",    atomic_load_explicit(&p_hold_ms,      memory_order_relaxed));
+	send_one_float(dst, "/cinecomp/knee_db",    atomic_load_explicit(&p_knee_db,      memory_order_relaxed));
+	send_one_float(dst, "/cinecomp/makeup_db",  atomic_load_explicit(&p_makeup_db,    memory_order_relaxed));
+	send_one_float(dst, "/cinecomp/wet_dry",    atomic_load_explicit(&p_wet_dry,      memory_order_relaxed));
+	send_one_float(dst, "/cinecomp/rms_win_ms", atomic_load_explicit(&p_rms_win_ms,   memory_order_relaxed));
+	send_one_float(dst, "/cinecomp/sc_hpf_hz",  atomic_load_explicit(&p_sc_hpf_hz,    memory_order_relaxed));
+	send_one_float(dst, "/cinecomp/lookahead_ms", atomic_load_explicit(&p_lookahead_ms, memory_order_relaxed));
+	send_one_float(dst, "/cinecomp/max_gain",   atomic_load_explicit(&p_max_gain_db,  memory_order_relaxed));
+	send_one_int  (dst, "/cinecomp/detector",   atomic_load_explicit(&p_detector_mode, memory_order_relaxed));
+	send_one_int  (dst, "/cinecomp/downward/enable",   atomic_load_explicit(&p_downward_en,    memory_order_relaxed));
+	send_one_float(dst, "/cinecomp/downward/threshold", atomic_load_explicit(&p_down_threshold, memory_order_relaxed));
+	send_one_float(dst, "/cinecomp/downward/ratio",     atomic_load_explicit(&p_down_ratio,     memory_order_relaxed));
+	send_one_int  (dst, "/cinecomp/bypass",     atomic_load_explicit(&p_bypass,       memory_order_relaxed));
+	send_one_int  (dst, "/cinecomp/preset/active", engine_preset_active());
 
 	/* Zonal-architecture params. */
-	send_one_int  (dst, "/filmcomp/architecture",   atomic_load_explicit(&p_architecture_mode, memory_order_relaxed));
-	send_one_float(dst, "/filmcomp/atmo/threshold", atomic_load_explicit(&p_atmo_threshold,    memory_order_relaxed));
-	send_one_float(dst, "/filmcomp/atmo/max_gain",  atomic_load_explicit(&p_atmo_max_gain,     memory_order_relaxed));
-	send_one_float(dst, "/filmcomp/atmo/knee",      atomic_load_explicit(&p_atmo_knee,         memory_order_relaxed));
-	send_one_float(dst, "/filmcomp/dialog/threshold", atomic_load_explicit(&p_dialog_threshold,  memory_order_relaxed));
-	send_one_float(dst, "/filmcomp/dialog/max_gain",  atomic_load_explicit(&p_dialog_max_gain,   memory_order_relaxed));
-	send_one_float(dst, "/filmcomp/dialog/knee",      atomic_load_explicit(&p_dialog_knee,       memory_order_relaxed));
-	send_one_float(dst, "/filmcomp/noise/floor",    atomic_load_explicit(&p_noise_floor_db,    memory_order_relaxed));
-	send_one_float(dst, "/filmcomp/noise/knee",     atomic_load_explicit(&p_noise_knee_db,     memory_order_relaxed));
-	send_one_float(dst, "/filmcomp/upward/attack_ms",  atomic_load_explicit(&p_upward_attack_ms,  memory_order_relaxed));
-	send_one_float(dst, "/filmcomp/upward/release_ms", atomic_load_explicit(&p_upward_release_ms, memory_order_relaxed));
-	send_one_float(dst, "/filmcomp/duck/attack_ms",    atomic_load_explicit(&p_duck_attack_ms,    memory_order_relaxed));
-	send_one_float(dst, "/filmcomp/duck/release_ms",   atomic_load_explicit(&p_duck_release_ms,   memory_order_relaxed));
+	send_one_int  (dst, "/cinecomp/architecture",   atomic_load_explicit(&p_architecture_mode, memory_order_relaxed));
+	send_one_float(dst, "/cinecomp/atmo/threshold", atomic_load_explicit(&p_atmo_threshold,    memory_order_relaxed));
+	send_one_float(dst, "/cinecomp/atmo/max_gain",  atomic_load_explicit(&p_atmo_max_gain,     memory_order_relaxed));
+	send_one_float(dst, "/cinecomp/atmo/knee",      atomic_load_explicit(&p_atmo_knee,         memory_order_relaxed));
+	send_one_float(dst, "/cinecomp/dialog/threshold", atomic_load_explicit(&p_dialog_threshold,  memory_order_relaxed));
+	send_one_float(dst, "/cinecomp/dialog/max_gain",  atomic_load_explicit(&p_dialog_max_gain,   memory_order_relaxed));
+	send_one_float(dst, "/cinecomp/dialog/knee",      atomic_load_explicit(&p_dialog_knee,       memory_order_relaxed));
+	send_one_float(dst, "/cinecomp/noise/floor",    atomic_load_explicit(&p_noise_floor_db,    memory_order_relaxed));
+	send_one_float(dst, "/cinecomp/noise/knee",     atomic_load_explicit(&p_noise_knee_db,     memory_order_relaxed));
+	send_one_float(dst, "/cinecomp/upward/attack_ms",  atomic_load_explicit(&p_upward_attack_ms,  memory_order_relaxed));
+	send_one_float(dst, "/cinecomp/upward/release_ms", atomic_load_explicit(&p_upward_release_ms, memory_order_relaxed));
+	send_one_float(dst, "/cinecomp/duck/attack_ms",    atomic_load_explicit(&p_duck_attack_ms,    memory_order_relaxed));
+	send_one_float(dst, "/cinecomp/duck/release_ms",   atomic_load_explicit(&p_duck_release_ms,   memory_order_relaxed));
 }
 
 static int sockaddr_eq(const struct sockaddr_in *a, const struct sockaddr_in *b) {
@@ -888,73 +888,73 @@ static void handle_osc(const uint8_t *buf, int len, struct sockaddr_in *src) {
 	#define READ_F(default_val) ((off + 4 <= len && types[1] == 'f') ? osc_read_float(buf, off) : (default_val))
 	#define READ_I(default_val) ((off + 4 <= len && types[1] == 'i') ? osc_read_int(buf, off) : (default_val))
 
-	if (strcmp(path, "/filmcomp/threshold")  == 0) atomic_store(&p_threshold_db, fclampf(READ_F(0.0f), -60.0f, 0.0f));
-	else if (strcmp(path, "/filmcomp/ratio") == 0) atomic_store(&p_ratio,        fclampf(READ_F(3.5f), 1.0f, 20.0f));
-	else if (strcmp(path, "/filmcomp/attack_ms")  == 0) atomic_store(&p_attack_ms,  fclampf(READ_F(30.0f), 1.0f, 200.0f));
-	else if (strcmp(path, "/filmcomp/release_ms") == 0) atomic_store(&p_release_ms, fclampf(READ_F(400.0f), 10.0f, 2000.0f));
-	else if (strcmp(path, "/filmcomp/hold_ms") == 0) atomic_store(&p_hold_ms, fclampf(READ_F(25.0f), 0.0f, 200.0f));
-	else if (strcmp(path, "/filmcomp/knee_db") == 0) atomic_store(&p_knee_db, fclampf(READ_F(6.0f), 0.0f, 30.0f));
-	else if (strcmp(path, "/filmcomp/makeup_db") == 0) atomic_store(&p_makeup_db, fclampf(READ_F(0.0f), -12.0f, 18.0f));
-	else if (strcmp(path, "/filmcomp/wet_dry") == 0) atomic_store(&p_wet_dry, fclampf(READ_F(1.0f), 0.0f, 1.0f));
-	else if (strcmp(path, "/filmcomp/rms_win_ms") == 0) atomic_store(&p_rms_win_ms, fclampf(READ_F(300.0f), 10.0f, 2000.0f));
-	else if (strcmp(path, "/filmcomp/sc_hpf_hz") == 0) atomic_store(&p_sc_hpf_hz, fclampf(READ_F(60.0f), 20.0f, 500.0f));
-	else if (strcmp(path, "/filmcomp/lookahead_ms") == 0) atomic_store(&p_lookahead_ms, fclampf(READ_F(5.0f), 0.0f, 20.0f));
-	else if (strcmp(path, "/filmcomp/max_gain") == 0) atomic_store(&p_max_gain_db, fclampf(READ_F(12.0f), 0.0f, 30.0f));
-	else if (strcmp(path, "/filmcomp/detector") == 0) {
+	if (strcmp(path, "/cinecomp/threshold")  == 0) atomic_store(&p_threshold_db, fclampf(READ_F(0.0f), -60.0f, 0.0f));
+	else if (strcmp(path, "/cinecomp/ratio") == 0) atomic_store(&p_ratio,        fclampf(READ_F(3.5f), 1.0f, 20.0f));
+	else if (strcmp(path, "/cinecomp/attack_ms")  == 0) atomic_store(&p_attack_ms,  fclampf(READ_F(30.0f), 1.0f, 200.0f));
+	else if (strcmp(path, "/cinecomp/release_ms") == 0) atomic_store(&p_release_ms, fclampf(READ_F(400.0f), 10.0f, 2000.0f));
+	else if (strcmp(path, "/cinecomp/hold_ms") == 0) atomic_store(&p_hold_ms, fclampf(READ_F(25.0f), 0.0f, 200.0f));
+	else if (strcmp(path, "/cinecomp/knee_db") == 0) atomic_store(&p_knee_db, fclampf(READ_F(6.0f), 0.0f, 30.0f));
+	else if (strcmp(path, "/cinecomp/makeup_db") == 0) atomic_store(&p_makeup_db, fclampf(READ_F(0.0f), -12.0f, 18.0f));
+	else if (strcmp(path, "/cinecomp/wet_dry") == 0) atomic_store(&p_wet_dry, fclampf(READ_F(1.0f), 0.0f, 1.0f));
+	else if (strcmp(path, "/cinecomp/rms_win_ms") == 0) atomic_store(&p_rms_win_ms, fclampf(READ_F(300.0f), 10.0f, 2000.0f));
+	else if (strcmp(path, "/cinecomp/sc_hpf_hz") == 0) atomic_store(&p_sc_hpf_hz, fclampf(READ_F(60.0f), 20.0f, 500.0f));
+	else if (strcmp(path, "/cinecomp/lookahead_ms") == 0) atomic_store(&p_lookahead_ms, fclampf(READ_F(5.0f), 0.0f, 20.0f));
+	else if (strcmp(path, "/cinecomp/max_gain") == 0) atomic_store(&p_max_gain_db, fclampf(READ_F(12.0f), 0.0f, 30.0f));
+	else if (strcmp(path, "/cinecomp/detector") == 0) {
 		int v = READ_I(0);
 		/* 0=RMS, 1=Peak, 2=Dual (zonal only). Clamp to [0,2]. */
 		if (v < 0) v = 0; else if (v > 2) v = 2;
 		atomic_store(&p_detector_mode, v);
 	}
-	else if (strcmp(path, "/filmcomp/downward/enable") == 0) atomic_store(&p_downward_en, READ_I(0) ? 1 : 0);
-	else if (strcmp(path, "/filmcomp/downward/threshold") == 0) atomic_store(&p_down_threshold, fclampf(READ_F(-6.0f), -60.0f, 0.0f));
-	else if (strcmp(path, "/filmcomp/downward/ratio") == 0) atomic_store(&p_down_ratio, fclampf(READ_F(4.0f), 1.0f, 20.0f));
-	else if (strcmp(path, "/filmcomp/bypass") == 0) atomic_store(&p_bypass, READ_I(1) ? 1 : 0);
-	else if (strcmp(path, "/filmcomp/architecture") == 0) {
+	else if (strcmp(path, "/cinecomp/downward/enable") == 0) atomic_store(&p_downward_en, READ_I(0) ? 1 : 0);
+	else if (strcmp(path, "/cinecomp/downward/threshold") == 0) atomic_store(&p_down_threshold, fclampf(READ_F(-6.0f), -60.0f, 0.0f));
+	else if (strcmp(path, "/cinecomp/downward/ratio") == 0) atomic_store(&p_down_ratio, fclampf(READ_F(4.0f), 1.0f, 20.0f));
+	else if (strcmp(path, "/cinecomp/bypass") == 0) atomic_store(&p_bypass, READ_I(1) ? 1 : 0);
+	else if (strcmp(path, "/cinecomp/architecture") == 0) {
 		int v = READ_I(0);
 		if (v < 0) v = 0; else if (v > 2) v = 2;
 		atomic_store(&p_architecture_mode, v);
 	}
-	else if (strcmp(path, "/filmcomp/atmo/threshold") == 0) atomic_store(&p_atmo_threshold, fclampf(READ_F(-35.0f), -80.0f, 0.0f));
-	else if (strcmp(path, "/filmcomp/atmo/max_gain") == 0) atomic_store(&p_atmo_max_gain, fclampf(READ_F(24.0f), 0.0f, 30.0f));
-	else if (strcmp(path, "/filmcomp/atmo/knee") == 0) atomic_store(&p_atmo_knee, fclampf(READ_F(20.0f), 0.0f, 30.0f));
-	else if (strcmp(path, "/filmcomp/dialog/threshold") == 0) atomic_store(&p_dialog_threshold, fclampf(READ_F(-10.5f), -60.0f, 0.0f));
-	else if (strcmp(path, "/filmcomp/dialog/max_gain") == 0) atomic_store(&p_dialog_max_gain, fclampf(READ_F(10.0f), 0.0f, 30.0f));
-	else if (strcmp(path, "/filmcomp/dialog/knee") == 0) atomic_store(&p_dialog_knee, fclampf(READ_F(13.5f), 0.0f, 30.0f));
-	else if (strcmp(path, "/filmcomp/noise/floor") == 0) atomic_store(&p_noise_floor_db, fclampf(READ_F(-70.5f), -90.0f, -20.0f));
-	else if (strcmp(path, "/filmcomp/noise/knee") == 0) atomic_store(&p_noise_knee_db, fclampf(READ_F(10.5f), 0.0f, 30.0f));
-	else if (strcmp(path, "/filmcomp/upward/attack_ms") == 0) atomic_store(&p_upward_attack_ms, fclampf(READ_F(451.0f), 1.0f, 5000.0f));
-	else if (strcmp(path, "/filmcomp/upward/release_ms") == 0) atomic_store(&p_upward_release_ms, fclampf(READ_F(20.0f), 1.0f, 10000.0f));
-	else if (strcmp(path, "/filmcomp/duck/attack_ms") == 0) atomic_store(&p_duck_attack_ms, fclampf(READ_F(9.0f), 0.1f, 100.0f));
-	else if (strcmp(path, "/filmcomp/duck/release_ms") == 0) atomic_store(&p_duck_release_ms, fclampf(READ_F(51.0f), 1.0f, 2000.0f));
-	else if (strcmp(path, "/filmcomp/preset/select") == 0) engine_preset_apply((engine_preset_slot_t)READ_I(1));
-	else if (strcmp(path, "/filmcomp/preset/save")   == 0) engine_preset_save((engine_preset_slot_t)READ_I(engine_preset_active() < 0 ? 1 : engine_preset_active()));
-	else if (strcmp(path, "/filmcomp/preset/reset")  == 0) engine_preset_reset((engine_preset_slot_t)READ_I(engine_preset_active() < 0 ? 1 : engine_preset_active()));
+	else if (strcmp(path, "/cinecomp/atmo/threshold") == 0) atomic_store(&p_atmo_threshold, fclampf(READ_F(-35.0f), -80.0f, 0.0f));
+	else if (strcmp(path, "/cinecomp/atmo/max_gain") == 0) atomic_store(&p_atmo_max_gain, fclampf(READ_F(24.0f), 0.0f, 30.0f));
+	else if (strcmp(path, "/cinecomp/atmo/knee") == 0) atomic_store(&p_atmo_knee, fclampf(READ_F(20.0f), 0.0f, 30.0f));
+	else if (strcmp(path, "/cinecomp/dialog/threshold") == 0) atomic_store(&p_dialog_threshold, fclampf(READ_F(-10.5f), -60.0f, 0.0f));
+	else if (strcmp(path, "/cinecomp/dialog/max_gain") == 0) atomic_store(&p_dialog_max_gain, fclampf(READ_F(10.0f), 0.0f, 30.0f));
+	else if (strcmp(path, "/cinecomp/dialog/knee") == 0) atomic_store(&p_dialog_knee, fclampf(READ_F(13.5f), 0.0f, 30.0f));
+	else if (strcmp(path, "/cinecomp/noise/floor") == 0) atomic_store(&p_noise_floor_db, fclampf(READ_F(-70.5f), -90.0f, -20.0f));
+	else if (strcmp(path, "/cinecomp/noise/knee") == 0) atomic_store(&p_noise_knee_db, fclampf(READ_F(10.5f), 0.0f, 30.0f));
+	else if (strcmp(path, "/cinecomp/upward/attack_ms") == 0) atomic_store(&p_upward_attack_ms, fclampf(READ_F(451.0f), 1.0f, 5000.0f));
+	else if (strcmp(path, "/cinecomp/upward/release_ms") == 0) atomic_store(&p_upward_release_ms, fclampf(READ_F(20.0f), 1.0f, 10000.0f));
+	else if (strcmp(path, "/cinecomp/duck/attack_ms") == 0) atomic_store(&p_duck_attack_ms, fclampf(READ_F(9.0f), 0.1f, 100.0f));
+	else if (strcmp(path, "/cinecomp/duck/release_ms") == 0) atomic_store(&p_duck_release_ms, fclampf(READ_F(51.0f), 1.0f, 2000.0f));
+	else if (strcmp(path, "/cinecomp/preset/select") == 0) engine_preset_apply((engine_preset_slot_t)READ_I(1));
+	else if (strcmp(path, "/cinecomp/preset/save")   == 0) engine_preset_save((engine_preset_slot_t)READ_I(engine_preset_active() < 0 ? 1 : engine_preset_active()));
+	else if (strcmp(path, "/cinecomp/preset/reset")  == 0) engine_preset_reset((engine_preset_slot_t)READ_I(engine_preset_active() < 0 ? 1 : engine_preset_active()));
 	/* Named presets: single string arg = preset name. LAN scope. */
-	else if (strcmp(path, "/filmcomp/named/save") == 0) {
+	else if (strcmp(path, "/cinecomp/named/save") == 0) {
 		char nm[ENGINE_NAME_LEN];
 		if (off + 4 <= len && types[1] == 's') {
 			osc_read_string(buf, len, off, nm, sizeof(nm));
 			engine_named_save(nm);
 		}
 	}
-	else if (strcmp(path, "/filmcomp/named/apply") == 0) {
+	else if (strcmp(path, "/cinecomp/named/apply") == 0) {
 		char nm[ENGINE_NAME_LEN];
 		if (off + 4 <= len && types[1] == 's') {
 			osc_read_string(buf, len, off, nm, sizeof(nm));
 			engine_named_apply(nm);
 		}
 	}
-	else if (strcmp(path, "/filmcomp/named/delete") == 0) {
+	else if (strcmp(path, "/cinecomp/named/delete") == 0) {
 		char nm[ENGINE_NAME_LEN];
 		if (off + 4 <= len && types[1] == 's') {
 			osc_read_string(buf, len, off, nm, sizeof(nm));
 			engine_named_delete(nm);
 		}
 	}
-	else if (strcmp(path, "/filmcomp/subscribe") == 0) subscribe(src);
-	else if (strcmp(path, "/filmcomp/unsubscribe") == 0) unsubscribe(src);
-	else if (strcmp(path, "/filmcomp/get") == 0) send_state(src);
+	else if (strcmp(path, "/cinecomp/subscribe") == 0) subscribe(src);
+	else if (strcmp(path, "/cinecomp/unsubscribe") == 0) unsubscribe(src);
+	else if (strcmp(path, "/cinecomp/get") == 0) send_state(src);
 	else if (verbose) fprintf(stderr, "osc: unhandled path %s (types %s)\n", path, types);
 
 	#undef READ_F

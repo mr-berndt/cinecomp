@@ -1,7 +1,7 @@
 #!/bin/bash
-# Build a .deb package for the filmcomp standalone.
+# Build a .deb package for the cinecomp standalone.
 #
-# Output: dist/filmcomp_<version>_amd64.deb
+# Output: dist/cinecomp_<version>_amd64.deb
 #
 # Run as user (no sudo needed). Builds inside a debian:12 (bookworm,
 # glibc 2.36) docker container so the host needs no libjack/glfw dev
@@ -18,12 +18,12 @@ cd "$PKGROOT"
 
 DIST="$PKGROOT/dist"
 STAGE="$PKGROOT/dist/stage"
-DEB="$DIST/filmcomp_${VERSION}_amd64.deb"
+DEB="$DIST/cinecomp_${VERSION}_amd64.deb"
 
 rm -rf "$STAGE"
 mkdir -p "$DIST" "$STAGE/usr/local/bin" "$STAGE/DEBIAN" \
          "$STAGE/usr/share/applications" \
-         "$STAGE/usr/share/doc/filmcomp"
+         "$STAGE/usr/share/doc/cinecomp"
 
 # --- Build the binary ---------------------------------------------------------
 if [[ "${BUILD_NATIVE:-0}" == "1" ]]; then
@@ -39,22 +39,22 @@ else
             apt-get update -qq >/dev/null &&
             apt-get install -y -qq build-essential libjack-jackd2-dev libglfw3-dev libgl-dev pkg-config >/dev/null &&
             cd /build && make clean && make &&
-            chown $(id -u):$(id -g) filmcomp src/*.o vendor/imgui/*.o vendor/imgui/backends/*.o 2>/dev/null || true
+            chown $(id -u):$(id -g) cinecomp src/*.o vendor/imgui/*.o vendor/imgui/backends/*.o 2>/dev/null || true
         "
 fi
 
 # --- Stage files --------------------------------------------------------------
-install -m 0755 filmcomp        "$STAGE/usr/local/bin/filmcomp"
-install -m 0644 README.md       "$STAGE/usr/share/doc/filmcomp/README.md"
+install -m 0755 cinecomp        "$STAGE/usr/local/bin/cinecomp"
+install -m 0644 README.md       "$STAGE/usr/share/doc/cinecomp/README.md"
 
 # Desktop entry so DAWs / file managers / app launchers see it.
-cat > "$STAGE/usr/share/applications/filmcomp.desktop" <<EOF
+cat > "$STAGE/usr/share/applications/cinecomp.desktop" <<EOF
 [Desktop Entry]
 Type=Application
-Name=filmcomp
+Name=cinecomp
 GenericName=Upward Compressor for Film
 Comment=JACK-based upward dynamic range compressor for film playback
-Exec=/usr/local/bin/filmcomp
+Exec=/usr/local/bin/cinecomp
 Icon=audio-x-generic
 Terminal=false
 Categories=AudioVideo;Audio;
@@ -64,7 +64,7 @@ EOF
 # --- Control file -------------------------------------------------------------
 SIZE_KB=$(du -sk "$STAGE" | cut -f1)
 cat > "$STAGE/DEBIAN/control" <<EOF
-Package: filmcomp
+Package: cinecomp
 Version: $VERSION
 Section: sound
 Priority: optional
@@ -72,7 +72,7 @@ Architecture: amd64
 Installed-Size: $SIZE_KB
 Depends: libjack-jackd2-0 | libjack0, libglfw3, libgl1
 Maintainer: Abacus Electronics <avm-project@humboldtforum.org>
-Description: filmcomp — Upward compressor for film playback
+Description: cinecomp — Upward compressor for film playback
  Self-contained JACK client with native Dear ImGui control surface.
  Lifts quiet program material (dialog, ambience) without touching loud
  transients. Layout-agnostic 8-channel side-chain detection (Stereo,
@@ -84,7 +84,7 @@ Description: filmcomp — Upward compressor for film playback
  since 2026-05-15 — pump-resistant on real cinema material).
  .
  Originated as the engine of the aroio6 Buildroot package
- \`aroio_filmcomp\`. Settings persist to \$XDG_CONFIG_HOME/filmcomp/state.ini.
+ \`aroio_filmcomp\`. Settings persist to \$XDG_CONFIG_HOME/cinecomp/state.ini.
 EOF
 
 # --- Build the .deb -----------------------------------------------------------
