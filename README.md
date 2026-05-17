@@ -259,8 +259,10 @@ Legacy classic-stage params (ignored — architecture is fixed v2):
 On first start (no state file) the MID values are applied; later changes
 are persisted to the state file.
 
-## Licenses
+## License
 
-- cinecomp code: proprietary (Abacus Electronics)
+MIT — see [LICENSE](LICENSE).
+
+Bundled third-party components:
 - Dear ImGui: MIT — `vendor/imgui/LICENSE.txt`
 - GLFW: zlib/libpng — distribution package
