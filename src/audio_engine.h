@@ -1,21 +1,22 @@
 /*
- * audio_engine.h — public interface to the aroio_filmcomp DSP/JACK
- * engine for the standalone GUI build.
+ * audio_engine.h — public interface to the filmcomp DSP/JACK engine for
+ * the standalone GUI build.
  *
- * The engine is what was the entire body of aroio_filmcomp.c (Atomic
- * params, audio_callback, JACK port wiring, peak broadcast); we lift
- * out only what the GUI thread needs:
+ * The engine is the same DSP body as the aroio6-Buildroot package
+ * `aroio_filmcomp` (Atomic params, audio_callback, JACK port wiring,
+ * peak broadcast, OSC server). The standalone build wraps the engine
+ * into a small public API so the ImGui front-end can:
  *   - start/stop the engine
  *   - read/write parameter values (Atomic-safe from any thread)
  *   - read live meter values for display
  *
- * The OSC server inside the engine continues to run unchanged, so the
- * standalone binary keeps OSC remote-control parity with the Buildroot
- * version (same OSC paths under the /filmcomp/ tree).
+ * OSC server inside the engine runs unchanged, so the standalone binary
+ * keeps OSC remote-control parity with the Buildroot variant (same
+ * /filmcomp/* paths, including the v2 zonal architecture knobs).
  */
 
-#ifndef AROIO_FILMCOMP_AUDIO_ENGINE_H
-#define AROIO_FILMCOMP_AUDIO_ENGINE_H
+#ifndef FILMCOMP_AUDIO_ENGINE_H
+#define FILMCOMP_AUDIO_ENGINE_H
 
 #ifdef __cplusplus
 extern "C" {
@@ -24,7 +25,8 @@ extern "C" {
 #define ENGINE_N_CHANNELS 8
 
 /* Parameter IDs — one per knob/toggle the GUI exposes. Internally
- * mapped onto the engine's _Atomic globals. */
+ * mapped onto the engine's _Atomic globals. The float-IDs come first
+ * (so they index a contiguous range), then the int/bool-IDs. */
 typedef enum {
     PARAM_THRESHOLD,
     PARAM_RATIO,
@@ -40,11 +42,27 @@ typedef enum {
     PARAM_MAX_GAIN_DB,
     PARAM_DOWN_THRESHOLD,
     PARAM_DOWN_RATIO,
+
+    /* Zonal-architecture float params (v1 summed + v2 band-shaped). */
+    PARAM_ATMO_THRESHOLD,
+    PARAM_ATMO_MAX_GAIN,
+    PARAM_ATMO_KNEE,
+    PARAM_DIALOG_THRESHOLD,
+    PARAM_DIALOG_MAX_GAIN,
+    PARAM_DIALOG_KNEE,
+    PARAM_NOISE_FLOOR_DB,
+    PARAM_NOISE_KNEE_DB,
+    PARAM_UPWARD_ATTACK_MS,
+    PARAM_UPWARD_RELEASE_MS,
+    PARAM_DUCK_ATTACK_MS,
+    PARAM_DUCK_RELEASE_MS,
+
     PARAM__FLOAT_COUNT,
 
-    PARAM_DETECTOR_MODE = PARAM__FLOAT_COUNT,   /* int 0=RMS, 1=Peak */
+    PARAM_DETECTOR_MODE = PARAM__FLOAT_COUNT,   /* int 0=RMS, 1=Peak, 2=Dual */
     PARAM_DOWNWARD_EN,                          /* int 0/1 */
     PARAM_BYPASS,                               /* int 0/1 */
+    PARAM_ARCHITECTURE_MODE,                    /* int 0=classic, 1=v1, 2=v2 */
     PARAM__TOTAL_COUNT
 } engine_param_t;
 
@@ -93,6 +111,7 @@ typedef struct {
     float f[PARAM__FLOAT_COUNT];
     int   detector_mode;
     int   downward_en;
+    int   architecture_mode;
 } engine_preset_t;
 
 /* Apply a preset: copy preset[slot] into live atomic params, mark as
@@ -116,8 +135,29 @@ void engine_preset_set(engine_preset_slot_t slot, const engine_preset_t *in);
 /* Label string for a slot, e.g. "low", "mid", "high". */
 const char *engine_preset_name(engine_preset_slot_t slot);
 
+/* ----------------------- Named presets --------------------------------- */
+/* User-defined preset library — arbitrary names, no fixed slots. Mirrors
+ * the aroio6 web UI: one dropdown with Factory (LOW/MID/HIGH) + Eigene
+ * (named). Names are kept sorted for stable dropdown order. */
+
+#define ENGINE_NAMED_MAX 64
+#define ENGINE_NAME_LEN  33   /* 32 chars + NUL */
+
+int  engine_named_count(void);
+const char *engine_named_name(int idx);            /* idx 0..count-1, sorted */
+int  engine_named_get(const char *name, engine_preset_t *out); /* 0=ok, -1=miss */
+int  engine_named_save(const char *name);          /* snapshot live params; create/overwrite. 0=ok */
+int  engine_named_delete(const char *name);        /* 1 if removed, 0 if absent */
+int  engine_named_apply(const char *name);         /* load into live params; 0=ok, -1=miss */
+const char *engine_named_active(void);             /* "" if none */
+void engine_named_set_active(const char *name);    /* NULL/"" clears */
+
+/* Persistence helper: create/overwrite a named preset directly from a
+ * buffer (no live-param snapshot). Used by the state.ini loader. */
+void engine_named_set(const char *name, const engine_preset_t *in);
+
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* AROIO_FILMCOMP_AUDIO_ENGINE_H */
+#endif /* FILMCOMP_AUDIO_ENGINE_H */

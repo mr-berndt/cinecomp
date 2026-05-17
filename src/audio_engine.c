@@ -1,5 +1,10 @@
 /*
- * aroio_filmcomp — Upward / parallel compressor for film playback.
+ * filmcomp — Upward / parallel compressor for film playback.
+ *
+ * Standalone-app DSP body. Mirrors the aroio6-Buildroot package
+ * `aroio_filmcomp` (Aroio platform variant of the same engine) on a
+ * per-line basis, with a small wrapper API at the bottom so the
+ * ImGui front-end can drive parameters / read meters / apply presets.
  *
  * Topology: 8 inputs (7.1: L R C LFE LS RS RBL RBR) → side-chain
  * detector + gain computer → 8 outputs (1:1 channels, linked gain).
@@ -7,34 +12,45 @@
  * Realtime-safe audio thread (no malloc, no locks). OSC server and
  * peak reporter run in separate threads; communication via _Atomic.
  *
- * Sits between input_mix-volctl and BruteFIR in the aroio chain, so
- * the comp sees raw program dynamics (not EQ-colored signal). Plugin
- * has fixed 8 in/8 out ports — works correctly for stereo / 5.1 / 7.1
- * via smooth per-channel weights (silent channels drop out of the SC
- * detection automatically, no layout declaration needed).
+ * Three architecture modes:
+ *   0 = classic   — single upward stage + duck
+ *   1 = zonal v1  — summed Atmo + Dialog upward stages
+ *   2 = zonal v2  — band-shaped plateaus (default, 2026-05-15 tuning)
  *
  * OSC API (UDP, default port 14041):
- *   in:
+ *   in (classic + global):
  *     /filmcomp/threshold f          — dBFS for SC
  *     /filmcomp/ratio f              — 1.0 .. 20.0 (upward)
  *     /filmcomp/attack_ms f          — how fast boost ramps up
  *     /filmcomp/release_ms f         — how fast boost decays
  *     /filmcomp/hold_ms f            — anti-pump hold between A and R
- *     /filmcomp/knee_db f            — soft-knee width
+ *     /filmcomp/knee_db f            — soft-knee width (duck stage in zonal)
  *     /filmcomp/makeup_db f          — post-comp static gain
  *     /filmcomp/wet_dry f            — 0.0=dry .. 1.0=full comp
  *     /filmcomp/rms_win_ms f         — detector smoothing time
  *     /filmcomp/sc_hpf_hz f          — side-chain HPF corner
  *     /filmcomp/lookahead_ms f       — audio path delay (anti-overshoot)
- *     /filmcomp/max_gain f           — hard cap for upward boost (dB)
- *     /filmcomp/detector i           — 0=RMS broadband, 1=Peak follower
+ *     /filmcomp/max_gain f           — hard cap for upward boost (dB, classic)
+ *     /filmcomp/detector i           — 0=RMS, 1=Peak, 2=Dual (zonal-only)
  *     /filmcomp/downward/enable i    — 0/1
  *     /filmcomp/downward/threshold f
  *     /filmcomp/downward/ratio f
  *     /filmcomp/bypass i             — 0/1 (default 1 at boot)
+ *   in (zonal architecture):
+ *     /filmcomp/architecture i
+ *     /filmcomp/atmo/threshold f     /filmcomp/atmo/max_gain f    /filmcomp/atmo/knee f
+ *     /filmcomp/dialog/threshold f   /filmcomp/dialog/max_gain f  /filmcomp/dialog/knee f
+ *     /filmcomp/noise/floor f        /filmcomp/noise/knee f
+ *     /filmcomp/upward/attack_ms f   /filmcomp/upward/release_ms f
+ *     /filmcomp/duck/attack_ms f     /filmcomp/duck/release_ms f
+ *   in (preset control):
  *     /filmcomp/preset/select i      — apply preset N (0=low 1=mid 2=high)
  *     /filmcomp/preset/save   i      — save current params to preset N
  *     /filmcomp/preset/reset  i      — reset preset N to factory defaults
+ *     /filmcomp/named/save   s       — save live params under name S
+ *     /filmcomp/named/apply  s       — apply named preset S
+ *     /filmcomp/named/delete s       — delete named preset S
+ *   in (meter subscription):
  *     /filmcomp/subscribe            — sender added to broadcast list
  *     /filmcomp/unsubscribe          — sender removed
  *     /filmcomp/get                  — request current state
@@ -71,19 +87,19 @@
 #if defined(__x86_64__) || defined(__i386__)
 #  include <xmmintrin.h>
 #  include <pmmintrin.h>
-#  define AROIO_RT_INIT_FPU() do { \
+#  define FC_RT_INIT_FPU() do { \
        _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON); \
        _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON); \
    } while (0)
 #elif defined(__aarch64__)
-#  define AROIO_RT_INIT_FPU() do { \
+#  define FC_RT_INIT_FPU() do { \
        uint64_t fpcr; \
        __asm__ __volatile__("mrs %0, fpcr" : "=r"(fpcr)); \
        fpcr |= (1ULL << 24); \
        __asm__ __volatile__("msr fpcr, %0" :: "r"(fpcr)); \
    } while (0)
 #else
-#  define AROIO_RT_INIT_FPU() do { } while (0)
+#  define FC_RT_INIT_FPU() do { } while (0)
 #endif
 
 #define N_CHANNELS              8
@@ -109,59 +125,78 @@ static jack_port_t *in_ports[N_CHANNELS];
 static jack_port_t *out_ports[N_CHANNELS];
 static jack_nframes_t sample_rate = 48000;
 
-/* Parameters — set by OSC, read by audio thread.
+/* Parameters — set by GUI/OSC, read by audio thread.
  *
- * Defaults below match the "Mid" preset tuned 2026-05-12. Two test
- * scenes drove the values: a two-gunshot scene (transient leak) and
- * the alarm-clock-ticks-over-atmo from "A Quiet Place" (~1 Hz tick
- * cycle was modulating the background ambience). Properties:
- *   - threshold -10.5 lets loud RMS content pass without lift; only
- *     dialog/ambient (SC < -10.5) gets boost
- *   - ratio 3 + max_gain 10 give a clean +10 dB on quiet stuff
- *   - release 10 + lookahead 15: transients reach the multiplier
- *     after ~1.5τ of release → ≤ +2 dB leak on shots
- *   - hold 0: peak detector holds itself; an extra hold gate would
- *     just block release on transients
- *   - rms_win 500 (peak release tau): slow enough that the gain
- *     doesn't fully recover between repeated transients (alarm-clock
- *     ticks etc.) → no audible boost modulation on the background
- *   - makeup -0.5: small trim, kept near 0 so loud material stays
- *     comparable to bypass */
-static _Atomic float p_threshold_db   = -10.5f;
-static _Atomic float p_ratio          =   3.0f;
+ * Defaults reflect the cinema-verified 2026-05-15 tuning (zonal v2,
+ * Peak detector). Atomic loads/stores keep cross-thread access safe
+ * without locks. */
+static _Atomic float p_threshold_db   = -10.0f;
+static _Atomic float p_ratio          =   6.0f;
 static _Atomic float p_attack_ms      =   5.0f;
-static _Atomic float p_release_ms     =  10.0f;
+static _Atomic float p_release_ms     = 800.0f;
 static _Atomic float p_hold_ms        =   0.0f;
-static _Atomic float p_knee_db        =   6.0f;
-static _Atomic float p_makeup_db      =  -0.5f;
+static _Atomic float p_knee_db        =  16.5f;  /* duck soft-knee in zonal */
+static _Atomic float p_makeup_db      =   0.0f;
 static _Atomic float p_wet_dry        =   1.0f;
-static _Atomic float p_rms_win_ms     = 500.0f;
-static _Atomic float p_sc_hpf_hz      =  60.0f;
-static _Atomic float p_lookahead_ms   =  15.0f;
-static _Atomic float p_max_gain_db    =  10.0f;
-/* 0 = broadband RMS (smoother on y² with rms_win_ms time constant).
- * 1 = peak follower (instant attack, exponential release; rms_win_ms
- *     acts as the release tau). Peak mode reacts to transients in
- *     <1 sample so look-ahead actually works as designed, and the
- *     decay is fast enough that a second transient ~50 ms later gets
- *     symmetric treatment instead of being clamped by the first one's
- *     RMS tail. Matches the detector type used by ffmpeg/mpv.
- *
- * Default 1 (Peak) — verified on film/gunshot material 2026-05-12. */
+static _Atomic float p_rms_win_ms     =  50.0f;
+static _Atomic float p_sc_hpf_hz      =  20.0f;
+static _Atomic float p_lookahead_ms   =  20.0f;
+static _Atomic float p_max_gain_db    =  18.5f;
+/* Detector mode: 0=RMS, 1=Peak, 2=Dual (RMS feeds upward, Peak feeds duck).
+ * Dual is meaningful only in zonal architecture mode — classic ignores it
+ * and falls back to RMS. */
 static _Atomic int   p_detector_mode  =   1;
-static _Atomic int   p_downward_en    =   0;
-static _Atomic float p_down_threshold =  -6.0f;
-static _Atomic float p_down_ratio     =   4.0f;
-static _Atomic int   p_bypass         =   1;   /* default ON: pass-through */
+static _Atomic int   p_downward_en    =   1;
+static _Atomic float p_down_threshold = -14.0f;
+static _Atomic float p_down_ratio     =   1.8f;
+static _Atomic int   p_bypass         =   0;   /* standalone processes by default
+                                                * (installed = meant to be used;
+                                                * the Aroio buildroot variant
+                                                * differs, boots bypassed) */
+
+/* ---- Zonal architecture (architecture_mode == 1 / 2) ----
+ *
+ * v1 (summed): two parallel upward stages plus duck. Each upward stage
+ *   has independent threshold + max_gain + knee, summed additively
+ *   before smoothing.
+ *
+ * v2 (band-shaped): atmo / dialog are plateaus on the SC axis with
+ *   smoothstep edges; no stage summing. Gain stays flat inside a zone,
+ *   transitions only across zone boundaries. Pump-resistant. Live-
+ *   verified across the four reference scenes (John-Wick, Quiet-Place
+ *   Wecker + Bastel, Boot hoher See). */
+static _Atomic int   p_architecture_mode = 2;   /* 0=classic, 1=v1, 2=v2 */
+static _Atomic float p_atmo_threshold    = -35.0f;
+static _Atomic float p_atmo_max_gain     =  24.0f;
+static _Atomic float p_atmo_knee         =  20.0f;
+static _Atomic float p_dialog_threshold  = -10.5f;
+static _Atomic float p_dialog_max_gain   =  10.0f;
+static _Atomic float p_dialog_knee       =  13.5f;
+static _Atomic float p_noise_floor_db    = -70.5f;
+static _Atomic float p_noise_knee_db     =  10.5f;
+static _Atomic float p_upward_attack_ms  = 451.0f; /* slow rise — pause-pump guard */
+static _Atomic float p_upward_release_ms =  20.0f; /* fast fall — no transient amp */
+static _Atomic float p_duck_attack_ms    =   9.0f;
+static _Atomic float p_duck_release_ms   =  51.0f;
 
 /* Audio-thread-local state (only audio thread writes & reads).
  * Initialised once in audio_callback first run. */
 static float rms_state[N_CHANNELS];
-static float peak_state[N_CHANNELS];   /* peak-follower output, mode=1 only */
+static float peak_state[N_CHANNELS];   /* peak-follower output, mode>=1 only */
+/* Second peak follower fed only when detector_mode==2 (dual), used by the
+ * duck stage in zonal architecture. Independent decay tied to
+ * duck_release_ms so the duck sees a true peak envelope while the upward
+ * stages see RMS. */
+static float peak_state_duck[N_CHANNELS];
 static float sc_hpf_z1[N_CHANNELS], sc_hpf_z2[N_CHANNELS];
 static float hpf_b0, hpf_b1, hpf_b2, hpf_a1, hpf_a2;
 static float current_hpf_hz = 0.0f;
 static float gain_current_db = 0.0f;
+/* Zonal mode runs split envelope followers — upward and duck have their
+ * own gain state and asymmetric time constants. Classic mode leaves
+ * these untouched and uses gain_current_db. */
+static float gain_upward_current_db = 0.0f;
+static float gain_duck_current_db   = 0.0f;
 static int   hold_counter = 0;
 static float delay_buf[N_CHANNELS][MAX_LOOKAHEAD_SAMPLES];
 static int   delay_pos = 0;
@@ -205,6 +240,48 @@ static inline float smoothstep_f(float lo, float hi, float x) {
 	if (x <= lo) return 0.0f;
 	if (x >= hi) return 1.0f;
 	float t = (x - lo) / (hi - lo);
+	return t * t * (3.0f - 2.0f * t);
+}
+
+/* Cubic-smoothstep S(t) = 3t² - 2t³ on [0,1], clamped at the edges.
+ * C¹-continuous so the zonal gain curve has no audible corners as the
+ * user drags a threshold knob across the SC the audio currently occupies. */
+static inline float smoothstep01(float t) {
+	if (t <= 0.0f) return 0.0f;
+	if (t >= 1.0f) return 1.0f;
+	return t * t * (3.0f - 2.0f * t);
+}
+
+/* Zone activity weight, centered at `center_db`, with `width_db` full
+ * transition width. Returns 1 on the LEFT side (sc << center), 0 on the
+ * RIGHT (sc >> center). Used by the v2 band-shaped zonal architecture
+ * to mark out atmo / dialog / action regions on the SC axis. */
+static inline float zone_active_below(float sc_db, float center_db, float width_db) {
+	if (width_db < 0.001f) return sc_db <= center_db ? 1.0f : 0.0f;
+	float half = width_db * 0.5f;
+	float t = (center_db + half - sc_db) / width_db;
+	return smoothstep01(t);
+}
+static inline float zone_active_above(float sc_db, float center_db, float width_db) {
+	return 1.0f - zone_active_below(sc_db, center_db, width_db);
+}
+
+/* Atmo-creep guard: returns scale factor in [0,1] for the atmo-stage
+ * lift, based on how far SC is below noise_floor_db. SC >= noise_floor
+ * returns 1.0 (no attenuation). SC <= noise_floor - knee returns 0.0
+ * (lift fully suppressed). Smoothed quadratic between for click-free
+ * transition. Effect: a real room-tone floor (e.g. -75 dB camera hiss)
+ * doesn't get amplified into audible noise, while a -50 dB film atmo
+ * gets full lift. */
+static inline float noise_floor_attenuation(float sc_db, float noise_floor_db,
+                                             float noise_knee_db) {
+	if (noise_knee_db < 0.001f) {
+		return sc_db >= noise_floor_db ? 1.0f : 0.0f;
+	}
+	if (sc_db >= noise_floor_db) return 1.0f;
+	if (sc_db <= noise_floor_db - noise_knee_db) return 0.0f;
+	/* Smoothstep: t = (sc - lo) / knee, mapped via 3t² - 2t³. */
+	float t = (sc_db - (noise_floor_db - noise_knee_db)) / noise_knee_db;
 	return t * t * (3.0f - 2.0f * t);
 }
 
@@ -300,7 +377,7 @@ static int audio_callback(jack_nframes_t nframes, void *arg) {
 	(void)arg;
 	static int rt_init_done = 0;
 	if (!rt_init_done) {
-		AROIO_RT_INIT_FPU();
+		FC_RT_INIT_FPU();
 		rt_init_done = 1;
 	}
 
@@ -311,6 +388,7 @@ static int audio_callback(jack_nframes_t nframes, void *arg) {
 				delay_buf[ch][i] = 0.0f;
 			rms_state[ch] = 1e-18f;
 			peak_state[ch] = 0.0f;
+			peak_state_duck[ch] = 0.0f;
 			sc_hpf_z1[ch] = sc_hpf_z2[ch] = 0.0f;
 		}
 		delay_initialised = 1;
@@ -335,6 +413,20 @@ static int audio_callback(jack_nframes_t nframes, void *arg) {
 	const float down_ratio    = atomic_load_explicit(&p_down_ratio,   memory_order_relaxed);
 	const int   bypass        = atomic_load_explicit(&p_bypass,       memory_order_relaxed);
 
+	const int   arch_mode     = atomic_load_explicit(&p_architecture_mode, memory_order_relaxed);
+	const float atmo_thr      = atomic_load_explicit(&p_atmo_threshold,    memory_order_relaxed);
+	const float atmo_max      = atomic_load_explicit(&p_atmo_max_gain,     memory_order_relaxed);
+	const float atmo_knee     = atomic_load_explicit(&p_atmo_knee,         memory_order_relaxed);
+	const float dialog_thr    = atomic_load_explicit(&p_dialog_threshold,  memory_order_relaxed);
+	const float dialog_max    = atomic_load_explicit(&p_dialog_max_gain,   memory_order_relaxed);
+	const float dialog_knee   = atomic_load_explicit(&p_dialog_knee,       memory_order_relaxed);
+	const float noise_floor   = atomic_load_explicit(&p_noise_floor_db,    memory_order_relaxed);
+	const float noise_knee    = atomic_load_explicit(&p_noise_knee_db,     memory_order_relaxed);
+	const float up_attack_ms  = atomic_load_explicit(&p_upward_attack_ms,  memory_order_relaxed);
+	const float up_release_ms = atomic_load_explicit(&p_upward_release_ms, memory_order_relaxed);
+	const float dk_attack_ms  = atomic_load_explicit(&p_duck_attack_ms,    memory_order_relaxed);
+	const float dk_release_ms = atomic_load_explicit(&p_duck_release_ms,   memory_order_relaxed);
+
 	/* Update HPF coefficients lazily on freq change. */
 	if (fabsf(sc_hpf_hz - current_hpf_hz) > 0.5f) {
 		update_hpf_coeffs(sc_hpf_hz, (float)sample_rate);
@@ -353,6 +445,18 @@ static int audio_callback(jack_nframes_t nframes, void *arg) {
 	const int   hold_samples  = (int)((hold_ms * 0.001f) * fs);
 	const int   look_samples  = fclampf((lookahead_ms * 0.001f) * fs, 0, MAX_LOOKAHEAD_SAMPLES - 1);
 
+	/* Zonal-mode alphas: separate envelopes per stage. Upward gets its
+	 * own slow attack so dialog pauses don't pump atmo up audibly. Duck
+	 * keeps fast attack to catch transients. */
+	const float up_attack_alpha  = 1.0f - expf(-1.0f / fmaxf(1.0f, (up_attack_ms  * 0.001f) * fs));
+	const float up_release_alpha = 1.0f - expf(-1.0f / fmaxf(1.0f, (up_release_ms * 0.001f) * fs));
+	const float dk_attack_alpha  = 1.0f - expf(-1.0f / fmaxf(1.0f, (dk_attack_ms  * 0.001f) * fs));
+	const float dk_release_alpha = 1.0f - expf(-1.0f / fmaxf(1.0f, (dk_release_ms * 0.001f) * fs));
+	/* Duck-path peak decay (used only when detector_mode==2): tied to
+	 * duck_release_ms so the peak envelope releases at the same rate the
+	 * gain envelope is allowed to decay. */
+	const float peak_decay_duck = expf(-1.0f / fmaxf(1.0f, (dk_release_ms * 0.001f) * fs));
+
 	float *in[N_CHANNELS], *out[N_CHANNELS];
 	for (int ch = 0; ch < N_CHANNELS; ch++) {
 		in[ch]  = jack_port_get_buffer(in_ports[ch], nframes);
@@ -366,9 +470,19 @@ static int audio_callback(jack_nframes_t nframes, void *arg) {
 	float sc_block_last = -120.0f;
 	float gain_block_last = 0.0f;
 
+	/* Whether we need the duck-specific peak follower (zonal+dual only). */
+	const int need_duck_peak = ((arch_mode == 1 || arch_mode == 2) && detector_mode == 2);
+
 	for (jack_nframes_t i = 0; i < nframes; i++) {
-		/* ---- Per-channel detection ---- */
-		float sum_w = 0.0f, sum_we = 0.0f;
+		/* ---- Per-channel detection ----
+		 *
+		 * Compute RMS and Peak follower outputs for every channel,
+		 * unconditionally. Zonal-dual mode needs both, classic modes
+		 * use only one — but the CPU cost of always computing both is
+		 * negligible (~one mul-add + one comparison per channel per
+		 * sample) and the dispatch becomes simpler. */
+		float sum_w = 0.0f;
+		float sum_we_rms = 0.0f, sum_we_peak = 0.0f, sum_we_peak_dk = 0.0f;
 
 		for (int ch = 0; ch < N_CHANNELS; ch++) {
 			float x = in[ch][i];
@@ -379,84 +493,161 @@ static int audio_callback(jack_nframes_t nframes, void *arg) {
 			float y = biquad_step(x, &sc_hpf_z1[ch], &sc_hpf_z2[ch],
 			                       hpf_b0, hpf_b1, hpf_b2,
 			                       hpf_a1, hpf_a2);
+			float ay = fabsf(y);
 
-			/* Detector: either RMS smoother on y², or peak follower
-			 * with instant attack + exponential release. Peak is
-			 * far better at catching transients (gunshots, doors)
-			 * because the level captures the rising edge in <1 sample
-			 * — the RMS smoother's tau-of-rms_win_ms would lag the
-			 * transient and let it through boosted. Layout-agnostic
-			 * either way: the per-channel weight handles silent ports. */
-			float level;
-			if (detector_mode == 1) {
-				float ay = fabsf(y);
-				if (ay > peak_state[ch]) peak_state[ch] = ay;
-				else                     peak_state[ch] *= peak_decay;
-				level = peak_state[ch];
-			} else {
-				rms_state[ch] += (y * y - rms_state[ch]) * rms_alpha;
-				level = sqrtf(rms_state[ch] + 1e-20f);
+			/* RMS smoother (always running). */
+			rms_state[ch] += (y * y - rms_state[ch]) * rms_alpha;
+			float lvl_rms = sqrtf(rms_state[ch] + 1e-20f);
+
+			/* Peak follower (always running). */
+			if (ay > peak_state[ch]) peak_state[ch] = ay;
+			else                     peak_state[ch] *= peak_decay;
+			float lvl_peak = peak_state[ch];
+
+			/* Duck-specific peak follower (zonal+dual only): independent
+			 * decay tied to duck_release_ms so the duck stage sees a
+			 * true peak envelope matched to its own release time. */
+			float lvl_peak_dk = lvl_peak;
+			if (need_duck_peak) {
+				if (ay > peak_state_duck[ch]) peak_state_duck[ch] = ay;
+				else                          peak_state_duck[ch] *= peak_decay_duck;
+				lvl_peak_dk = peak_state_duck[ch];
 			}
 
-			/* Smooth activity weight: 0 at ≤ -85 dB, 1 at ≥ -75 dB. */
-			float level_db = lin_to_db(level);
+			/* Activity weight: classic uses the active detector for
+			 * backward compatibility, zonal always uses RMS (more
+			 * stable, click-only channels don't get over-weighted). */
+			float weight_level = (arch_mode == 0 && detector_mode == 1)
+			                       ? lvl_peak : lvl_rms;
+			float level_db = lin_to_db(weight_level);
 			float w = smoothstep_f(
 				ACTIVITY_FLOOR_DB - ACTIVITY_SLOPE_DB,
 				ACTIVITY_FLOOR_DB + ACTIVITY_SLOPE_DB,
 				level_db);
 			if (w > weight_block[ch]) weight_block[ch] = w;
 
-			sum_w  += w;
-			sum_we += w * level * level;
+			sum_w           += w;
+			sum_we_rms      += w * lvl_rms     * lvl_rms;
+			sum_we_peak     += w * lvl_peak    * lvl_peak;
+			sum_we_peak_dk  += w * lvl_peak_dk * lvl_peak_dk;
 		}
 
-		/* SC = energy-mean of active channels.
-		 * Falls back to silence if no active channel. */
-		float sc;
+		/* SC = energy-mean of active channels for each detector path. */
+		float sc_rms_db, sc_peak_db, sc_peak_dk_db;
 		if (sum_w > 1e-6f) {
-			sc = sqrtf(sum_we / sum_w);
+			sc_rms_db     = lin_to_db(sqrtf(sum_we_rms     / sum_w));
+			sc_peak_db    = lin_to_db(sqrtf(sum_we_peak    / sum_w));
+			sc_peak_dk_db = lin_to_db(sqrtf(sum_we_peak_dk / sum_w));
 		} else {
-			sc = 0.0f;
+			sc_rms_db = sc_peak_db = sc_peak_dk_db = -120.0f;
 		}
-		float sc_db = lin_to_db(sc);
-		sc_block_last = sc_db;
+
+		/* Pick which SC each stage uses. */
+		float sc_up_db, sc_dn_db;
+		if ((arch_mode == 1 || arch_mode == 2) && detector_mode == 2) {
+			/* Zonal + dual: RMS for upward stages, Peak for duck. */
+			sc_up_db = sc_rms_db;
+			sc_dn_db = sc_peak_dk_db;
+		} else if (detector_mode == 1) {
+			sc_up_db = sc_dn_db = sc_peak_db;
+		} else {
+			sc_up_db = sc_dn_db = sc_rms_db;
+		}
+		/* Reporter publishes the upward-side SC (primary for the user). */
+		sc_block_last = sc_up_db;
 
 		/* ---- Gain target ---- */
-		float gain_up   = upward_gain_db(sc_db, threshold, ratio, knee_db);
-		/* Hard cap on upward boost: when very low-level program (or
-		 * leftover noise floor) drives the SC far below threshold,
-		 * (T - sc) * (1 - 1/R) grows without bound and produces
-		 * audible noise pumping. Clamp before adding makeup. */
-		if (gain_up > max_gain_db) gain_up = max_gain_db;
-		float gain_down = downward_en
-		                  ? downward_gain_db(sc_db, down_thr, down_ratio, knee_db)
-		                  : 0.0f;
-		float gain_target_db = gain_up + gain_down;
+		float gain_target_db;
 
-		/* ---- Smoothing with attack/release + hold ----
-		 * "Attack" = boost ANSTEIGT (gain_target > gain_current).
-		 * "Release" = boost FÄLLT (gain_target < gain_current).
-		 * Hold counter prevents premature release during short SC dips. */
-		if (gain_target_db > gain_current_db) {
-			/* Boost rises: attack phase. Hold has no effect here —
-			 * hold gates release, not attack. */
-			gain_current_db += (gain_target_db - gain_current_db) * attack_alpha;
-		} else if (gain_target_db < gain_current_db) {
-			/* Boost falls: release phase, gated by hold. */
-			if (hold_counter > 0) {
-				hold_counter--;
+		if (arch_mode == 1 || arch_mode == 2) {
+			/* ===== Zonal architecture =====
+			 * v1 (mode 1, summed): Two parallel upward stages
+			 *   (atmo + dialog), each capped by their own max_gain.
+			 *   The sum can give atmo_max + dialog_max at very low SC.
+			 *   Atmo throttled by the noise-floor knee.
+			 *
+			 * v2 (mode 2, band-shaped): Atmo and dialog are PLATEAUS
+			 *   on the SC axis, each with smoothstep edges. No
+			 *   summing of slopes — gain stays flat within a zone,
+			 *   transitions only across zone boundaries. */
+			float atmo_lift, dialog_lift;
+			if (arch_mode == 2) {
+				/* v2: smoothstep weights. atmo_thr is the
+				 * atmo↔dialog boundary, atmo_knee its transition
+				 * width. dialog_thr is the dialog↔action boundary,
+				 * dialog_knee its width. */
+				float w_atmo  = zone_active_below(sc_up_db, atmo_thr, atmo_knee);
+				float w_dial  = zone_active_above(sc_up_db, atmo_thr, atmo_knee)
+				              * zone_active_below(sc_up_db, dialog_thr, dialog_knee);
+				float noise_w = noise_floor_attenuation(sc_up_db, noise_floor, noise_knee);
+				atmo_lift   = atmo_max  * w_atmo * noise_w;
+				dialog_lift = dialog_max * w_dial;
 			} else {
-				gain_current_db += (gain_target_db - gain_current_db) * release_alpha;
+				/* v1: summed compressor stages. */
+				atmo_lift = upward_gain_db(sc_up_db, atmo_thr, ratio, atmo_knee);
+				if (atmo_lift > atmo_max) atmo_lift = atmo_max;
+				atmo_lift *= noise_floor_attenuation(sc_up_db, noise_floor, noise_knee);
+				dialog_lift = upward_gain_db(sc_up_db, dialog_thr, ratio, dialog_knee);
+				if (dialog_lift > dialog_max) dialog_lift = dialog_max;
 			}
+
+			float gain_up_target = atmo_lift + dialog_lift;
+			float gain_dn_target = downward_en
+			                        ? downward_gain_db(sc_dn_db, down_thr, down_ratio, knee_db)
+			                        : 0.0f;
+
+			/* Split envelope: upward has its own slow attack so
+			 * dialog pauses don't pump atmo up audibly. Duck has its
+			 * own fast attack so transients are caught instantly. */
+			if (gain_up_target > gain_upward_current_db) {
+				gain_upward_current_db += (gain_up_target - gain_upward_current_db) * up_attack_alpha;
+			} else {
+				gain_upward_current_db += (gain_up_target - gain_upward_current_db) * up_release_alpha;
+			}
+			/* Duck: gain is ≤ 0. "Engaging" = becoming more negative
+			 * = gain_dn_target < current. That direction gets
+			 * duck_attack_alpha. Release back to 0 gets duck_release_alpha. */
+			if (gain_dn_target < gain_duck_current_db) {
+				gain_duck_current_db += (gain_dn_target - gain_duck_current_db) * dk_attack_alpha;
+			} else {
+				gain_duck_current_db += (gain_dn_target - gain_duck_current_db) * dk_release_alpha;
+			}
+			gain_current_db = gain_upward_current_db + gain_duck_current_db;
+			gain_target_db = gain_up_target + gain_dn_target;
 		} else {
-			/* No change. Reset hold when we hit steady state. */
-			hold_counter = hold_samples;
-		}
-		/* Note: hold_counter is loaded each time attack is sustained
-		 * — i.e. when boost is steady-high, we keep refreshing the
-		 * hold so a brief peak doesn't trigger release. Done above
-		 * implicitly: every time gain_target == gain_current after
-		 * an attack settle, hold resets. */
+			/* ===== Classic architecture (unchanged math) ===== */
+			float gain_up   = upward_gain_db(sc_up_db, threshold, ratio, knee_db);
+			/* Hard cap on upward boost: when very low-level program
+			 * (or leftover noise floor) drives the SC far below
+			 * threshold, (T - sc) * (1 - 1/R) grows without bound
+			 * and produces audible noise pumping. Clamp before
+			 * adding makeup. */
+			if (gain_up > max_gain_db) gain_up = max_gain_db;
+			float gain_down = downward_en
+			                  ? downward_gain_db(sc_dn_db, down_thr, down_ratio, knee_db)
+			                  : 0.0f;
+			gain_target_db = gain_up + gain_down;
+
+			/* ---- Smoothing with attack/release + hold ----
+			 * "Attack" = boost ANSTEIGT (gain_target > gain_current).
+			 * "Release" = boost FÄLLT (gain_target < gain_current).
+			 * Hold counter prevents premature release during short SC dips. */
+			if (gain_target_db > gain_current_db) {
+				/* Boost rises: attack phase. Hold has no effect here —
+				 * hold gates release, not attack. */
+				gain_current_db += (gain_target_db - gain_current_db) * attack_alpha;
+			} else if (gain_target_db < gain_current_db) {
+				/* Boost falls: release phase, gated by hold. */
+				if (hold_counter > 0) {
+					hold_counter--;
+				} else {
+					gain_current_db += (gain_target_db - gain_current_db) * release_alpha;
+				}
+			} else {
+				/* No change. Reset hold when we hit steady state. */
+				hold_counter = hold_samples;
+			}
+		}  /* end classic-architecture branch */
 
 		gain_block_last = gain_current_db;
 
@@ -637,6 +828,21 @@ static void send_state(struct sockaddr_in *dst) {
 	send_one_float(dst, "/filmcomp/downward/ratio",     atomic_load_explicit(&p_down_ratio,     memory_order_relaxed));
 	send_one_int  (dst, "/filmcomp/bypass",     atomic_load_explicit(&p_bypass,       memory_order_relaxed));
 	send_one_int  (dst, "/filmcomp/preset/active", engine_preset_active());
+
+	/* Zonal-architecture params. */
+	send_one_int  (dst, "/filmcomp/architecture",   atomic_load_explicit(&p_architecture_mode, memory_order_relaxed));
+	send_one_float(dst, "/filmcomp/atmo/threshold", atomic_load_explicit(&p_atmo_threshold,    memory_order_relaxed));
+	send_one_float(dst, "/filmcomp/atmo/max_gain",  atomic_load_explicit(&p_atmo_max_gain,     memory_order_relaxed));
+	send_one_float(dst, "/filmcomp/atmo/knee",      atomic_load_explicit(&p_atmo_knee,         memory_order_relaxed));
+	send_one_float(dst, "/filmcomp/dialog/threshold", atomic_load_explicit(&p_dialog_threshold,  memory_order_relaxed));
+	send_one_float(dst, "/filmcomp/dialog/max_gain",  atomic_load_explicit(&p_dialog_max_gain,   memory_order_relaxed));
+	send_one_float(dst, "/filmcomp/dialog/knee",      atomic_load_explicit(&p_dialog_knee,       memory_order_relaxed));
+	send_one_float(dst, "/filmcomp/noise/floor",    atomic_load_explicit(&p_noise_floor_db,    memory_order_relaxed));
+	send_one_float(dst, "/filmcomp/noise/knee",     atomic_load_explicit(&p_noise_knee_db,     memory_order_relaxed));
+	send_one_float(dst, "/filmcomp/upward/attack_ms",  atomic_load_explicit(&p_upward_attack_ms,  memory_order_relaxed));
+	send_one_float(dst, "/filmcomp/upward/release_ms", atomic_load_explicit(&p_upward_release_ms, memory_order_relaxed));
+	send_one_float(dst, "/filmcomp/duck/attack_ms",    atomic_load_explicit(&p_duck_attack_ms,    memory_order_relaxed));
+	send_one_float(dst, "/filmcomp/duck/release_ms",   atomic_load_explicit(&p_duck_release_ms,   memory_order_relaxed));
 }
 
 static int sockaddr_eq(const struct sockaddr_in *a, const struct sockaddr_in *b) {
@@ -687,21 +893,65 @@ static void handle_osc(const uint8_t *buf, int len, struct sockaddr_in *src) {
 	else if (strcmp(path, "/filmcomp/attack_ms")  == 0) atomic_store(&p_attack_ms,  fclampf(READ_F(30.0f), 1.0f, 200.0f));
 	else if (strcmp(path, "/filmcomp/release_ms") == 0) atomic_store(&p_release_ms, fclampf(READ_F(400.0f), 10.0f, 2000.0f));
 	else if (strcmp(path, "/filmcomp/hold_ms") == 0) atomic_store(&p_hold_ms, fclampf(READ_F(25.0f), 0.0f, 200.0f));
-	else if (strcmp(path, "/filmcomp/knee_db") == 0) atomic_store(&p_knee_db, fclampf(READ_F(6.0f), 0.0f, 20.0f));
+	else if (strcmp(path, "/filmcomp/knee_db") == 0) atomic_store(&p_knee_db, fclampf(READ_F(6.0f), 0.0f, 30.0f));
 	else if (strcmp(path, "/filmcomp/makeup_db") == 0) atomic_store(&p_makeup_db, fclampf(READ_F(0.0f), -12.0f, 18.0f));
 	else if (strcmp(path, "/filmcomp/wet_dry") == 0) atomic_store(&p_wet_dry, fclampf(READ_F(1.0f), 0.0f, 1.0f));
-	else if (strcmp(path, "/filmcomp/rms_win_ms") == 0) atomic_store(&p_rms_win_ms, fclampf(READ_F(300.0f), 10.0f, 1000.0f));
+	else if (strcmp(path, "/filmcomp/rms_win_ms") == 0) atomic_store(&p_rms_win_ms, fclampf(READ_F(300.0f), 10.0f, 2000.0f));
 	else if (strcmp(path, "/filmcomp/sc_hpf_hz") == 0) atomic_store(&p_sc_hpf_hz, fclampf(READ_F(60.0f), 20.0f, 500.0f));
 	else if (strcmp(path, "/filmcomp/lookahead_ms") == 0) atomic_store(&p_lookahead_ms, fclampf(READ_F(5.0f), 0.0f, 20.0f));
 	else if (strcmp(path, "/filmcomp/max_gain") == 0) atomic_store(&p_max_gain_db, fclampf(READ_F(12.0f), 0.0f, 30.0f));
-	else if (strcmp(path, "/filmcomp/detector") == 0) atomic_store(&p_detector_mode, READ_I(0) ? 1 : 0);
+	else if (strcmp(path, "/filmcomp/detector") == 0) {
+		int v = READ_I(0);
+		/* 0=RMS, 1=Peak, 2=Dual (zonal only). Clamp to [0,2]. */
+		if (v < 0) v = 0; else if (v > 2) v = 2;
+		atomic_store(&p_detector_mode, v);
+	}
 	else if (strcmp(path, "/filmcomp/downward/enable") == 0) atomic_store(&p_downward_en, READ_I(0) ? 1 : 0);
 	else if (strcmp(path, "/filmcomp/downward/threshold") == 0) atomic_store(&p_down_threshold, fclampf(READ_F(-6.0f), -60.0f, 0.0f));
 	else if (strcmp(path, "/filmcomp/downward/ratio") == 0) atomic_store(&p_down_ratio, fclampf(READ_F(4.0f), 1.0f, 20.0f));
 	else if (strcmp(path, "/filmcomp/bypass") == 0) atomic_store(&p_bypass, READ_I(1) ? 1 : 0);
+	else if (strcmp(path, "/filmcomp/architecture") == 0) {
+		int v = READ_I(0);
+		if (v < 0) v = 0; else if (v > 2) v = 2;
+		atomic_store(&p_architecture_mode, v);
+	}
+	else if (strcmp(path, "/filmcomp/atmo/threshold") == 0) atomic_store(&p_atmo_threshold, fclampf(READ_F(-35.0f), -80.0f, 0.0f));
+	else if (strcmp(path, "/filmcomp/atmo/max_gain") == 0) atomic_store(&p_atmo_max_gain, fclampf(READ_F(24.0f), 0.0f, 30.0f));
+	else if (strcmp(path, "/filmcomp/atmo/knee") == 0) atomic_store(&p_atmo_knee, fclampf(READ_F(20.0f), 0.0f, 30.0f));
+	else if (strcmp(path, "/filmcomp/dialog/threshold") == 0) atomic_store(&p_dialog_threshold, fclampf(READ_F(-10.5f), -60.0f, 0.0f));
+	else if (strcmp(path, "/filmcomp/dialog/max_gain") == 0) atomic_store(&p_dialog_max_gain, fclampf(READ_F(10.0f), 0.0f, 30.0f));
+	else if (strcmp(path, "/filmcomp/dialog/knee") == 0) atomic_store(&p_dialog_knee, fclampf(READ_F(13.5f), 0.0f, 30.0f));
+	else if (strcmp(path, "/filmcomp/noise/floor") == 0) atomic_store(&p_noise_floor_db, fclampf(READ_F(-70.5f), -90.0f, -20.0f));
+	else if (strcmp(path, "/filmcomp/noise/knee") == 0) atomic_store(&p_noise_knee_db, fclampf(READ_F(10.5f), 0.0f, 30.0f));
+	else if (strcmp(path, "/filmcomp/upward/attack_ms") == 0) atomic_store(&p_upward_attack_ms, fclampf(READ_F(451.0f), 1.0f, 5000.0f));
+	else if (strcmp(path, "/filmcomp/upward/release_ms") == 0) atomic_store(&p_upward_release_ms, fclampf(READ_F(20.0f), 1.0f, 10000.0f));
+	else if (strcmp(path, "/filmcomp/duck/attack_ms") == 0) atomic_store(&p_duck_attack_ms, fclampf(READ_F(9.0f), 0.1f, 100.0f));
+	else if (strcmp(path, "/filmcomp/duck/release_ms") == 0) atomic_store(&p_duck_release_ms, fclampf(READ_F(51.0f), 1.0f, 2000.0f));
 	else if (strcmp(path, "/filmcomp/preset/select") == 0) engine_preset_apply((engine_preset_slot_t)READ_I(1));
 	else if (strcmp(path, "/filmcomp/preset/save")   == 0) engine_preset_save((engine_preset_slot_t)READ_I(engine_preset_active() < 0 ? 1 : engine_preset_active()));
 	else if (strcmp(path, "/filmcomp/preset/reset")  == 0) engine_preset_reset((engine_preset_slot_t)READ_I(engine_preset_active() < 0 ? 1 : engine_preset_active()));
+	/* Named presets: single string arg = preset name. LAN scope. */
+	else if (strcmp(path, "/filmcomp/named/save") == 0) {
+		char nm[ENGINE_NAME_LEN];
+		if (off + 4 <= len && types[1] == 's') {
+			osc_read_string(buf, len, off, nm, sizeof(nm));
+			engine_named_save(nm);
+		}
+	}
+	else if (strcmp(path, "/filmcomp/named/apply") == 0) {
+		char nm[ENGINE_NAME_LEN];
+		if (off + 4 <= len && types[1] == 's') {
+			osc_read_string(buf, len, off, nm, sizeof(nm));
+			engine_named_apply(nm);
+		}
+	}
+	else if (strcmp(path, "/filmcomp/named/delete") == 0) {
+		char nm[ENGINE_NAME_LEN];
+		if (off + 4 <= len && types[1] == 's') {
+			osc_read_string(buf, len, off, nm, sizeof(nm));
+			engine_named_delete(nm);
+		}
+	}
 	else if (strcmp(path, "/filmcomp/subscribe") == 0) subscribe(src);
 	else if (strcmp(path, "/filmcomp/unsubscribe") == 0) unsubscribe(src);
 	else if (strcmp(path, "/filmcomp/get") == 0) send_state(src);
@@ -806,8 +1056,8 @@ int engine_start(const char *name, int port) {
 	jack_set_process_callback(client, audio_callback, NULL);
 	jack_set_sample_rate_callback(client, sample_rate_callback, NULL);
 
-	update_hpf_coeffs(60.0f, (float)sample_rate);
-	current_hpf_hz = 60.0f;
+	update_hpf_coeffs(20.0f, (float)sample_rate);
+	current_hpf_hz = 20.0f;
 
 	if (jack_activate(client) < 0) {
 		fprintf(stderr, "jack_activate failed\n");
@@ -883,58 +1133,94 @@ unsigned engine_sample_rate(void) {
  * switches (one per type) to keep this branch-predictor-friendly. */
 float engine_get_param_f(engine_param_t id) {
 	switch (id) {
-	case PARAM_THRESHOLD:      return atomic_load(&p_threshold_db);
-	case PARAM_RATIO:          return atomic_load(&p_ratio);
-	case PARAM_ATTACK_MS:      return atomic_load(&p_attack_ms);
-	case PARAM_RELEASE_MS:     return atomic_load(&p_release_ms);
-	case PARAM_HOLD_MS:        return atomic_load(&p_hold_ms);
-	case PARAM_KNEE_DB:        return atomic_load(&p_knee_db);
-	case PARAM_MAKEUP_DB:      return atomic_load(&p_makeup_db);
-	case PARAM_WET_DRY:        return atomic_load(&p_wet_dry);
-	case PARAM_RMS_WIN_MS:     return atomic_load(&p_rms_win_ms);
-	case PARAM_SC_HPF_HZ:      return atomic_load(&p_sc_hpf_hz);
-	case PARAM_LOOKAHEAD_MS:   return atomic_load(&p_lookahead_ms);
-	case PARAM_MAX_GAIN_DB:    return atomic_load(&p_max_gain_db);
-	case PARAM_DOWN_THRESHOLD: return atomic_load(&p_down_threshold);
-	case PARAM_DOWN_RATIO:     return atomic_load(&p_down_ratio);
+	case PARAM_THRESHOLD:        return atomic_load(&p_threshold_db);
+	case PARAM_RATIO:            return atomic_load(&p_ratio);
+	case PARAM_ATTACK_MS:        return atomic_load(&p_attack_ms);
+	case PARAM_RELEASE_MS:       return atomic_load(&p_release_ms);
+	case PARAM_HOLD_MS:          return atomic_load(&p_hold_ms);
+	case PARAM_KNEE_DB:          return atomic_load(&p_knee_db);
+	case PARAM_MAKEUP_DB:        return atomic_load(&p_makeup_db);
+	case PARAM_WET_DRY:          return atomic_load(&p_wet_dry);
+	case PARAM_RMS_WIN_MS:       return atomic_load(&p_rms_win_ms);
+	case PARAM_SC_HPF_HZ:        return atomic_load(&p_sc_hpf_hz);
+	case PARAM_LOOKAHEAD_MS:     return atomic_load(&p_lookahead_ms);
+	case PARAM_MAX_GAIN_DB:      return atomic_load(&p_max_gain_db);
+	case PARAM_DOWN_THRESHOLD:   return atomic_load(&p_down_threshold);
+	case PARAM_DOWN_RATIO:       return atomic_load(&p_down_ratio);
+	case PARAM_ATMO_THRESHOLD:   return atomic_load(&p_atmo_threshold);
+	case PARAM_ATMO_MAX_GAIN:    return atomic_load(&p_atmo_max_gain);
+	case PARAM_ATMO_KNEE:        return atomic_load(&p_atmo_knee);
+	case PARAM_DIALOG_THRESHOLD: return atomic_load(&p_dialog_threshold);
+	case PARAM_DIALOG_MAX_GAIN:  return atomic_load(&p_dialog_max_gain);
+	case PARAM_DIALOG_KNEE:      return atomic_load(&p_dialog_knee);
+	case PARAM_NOISE_FLOOR_DB:   return atomic_load(&p_noise_floor_db);
+	case PARAM_NOISE_KNEE_DB:    return atomic_load(&p_noise_knee_db);
+	case PARAM_UPWARD_ATTACK_MS: return atomic_load(&p_upward_attack_ms);
+	case PARAM_UPWARD_RELEASE_MS:return atomic_load(&p_upward_release_ms);
+	case PARAM_DUCK_ATTACK_MS:   return atomic_load(&p_duck_attack_ms);
+	case PARAM_DUCK_RELEASE_MS:  return atomic_load(&p_duck_release_ms);
 	default: return 0.0f;
 	}
 }
 
 void engine_set_param_f(engine_param_t id, float v) {
 	switch (id) {
-	case PARAM_THRESHOLD:      atomic_store(&p_threshold_db, fclampf(v, -60.0f, 0.0f)); break;
-	case PARAM_RATIO:          atomic_store(&p_ratio,        fclampf(v, 1.0f, 20.0f)); break;
-	case PARAM_ATTACK_MS:      atomic_store(&p_attack_ms,    fclampf(v, 1.0f, 200.0f)); break;
-	case PARAM_RELEASE_MS:     atomic_store(&p_release_ms,   fclampf(v, 10.0f, 2000.0f)); break;
-	case PARAM_HOLD_MS:        atomic_store(&p_hold_ms,      fclampf(v, 0.0f, 200.0f)); break;
-	case PARAM_KNEE_DB:        atomic_store(&p_knee_db,      fclampf(v, 0.0f, 20.0f)); break;
-	case PARAM_MAKEUP_DB:      atomic_store(&p_makeup_db,    fclampf(v, -12.0f, 18.0f)); break;
-	case PARAM_WET_DRY:        atomic_store(&p_wet_dry,      fclampf(v, 0.0f, 1.0f)); break;
-	case PARAM_RMS_WIN_MS:     atomic_store(&p_rms_win_ms,   fclampf(v, 10.0f, 2000.0f)); break;
-	case PARAM_SC_HPF_HZ:      atomic_store(&p_sc_hpf_hz,    fclampf(v, 20.0f, 500.0f)); break;
-	case PARAM_LOOKAHEAD_MS:   atomic_store(&p_lookahead_ms, fclampf(v, 0.0f, 20.0f)); break;
-	case PARAM_MAX_GAIN_DB:    atomic_store(&p_max_gain_db,  fclampf(v, 0.0f, 30.0f)); break;
-	case PARAM_DOWN_THRESHOLD: atomic_store(&p_down_threshold, fclampf(v, -60.0f, 0.0f)); break;
-	case PARAM_DOWN_RATIO:     atomic_store(&p_down_ratio,   fclampf(v, 1.0f, 20.0f)); break;
+	case PARAM_THRESHOLD:        atomic_store(&p_threshold_db, fclampf(v, -60.0f, 0.0f)); break;
+	case PARAM_RATIO:            atomic_store(&p_ratio,        fclampf(v, 1.0f, 20.0f)); break;
+	case PARAM_ATTACK_MS:        atomic_store(&p_attack_ms,    fclampf(v, 1.0f, 200.0f)); break;
+	case PARAM_RELEASE_MS:       atomic_store(&p_release_ms,   fclampf(v, 10.0f, 2000.0f)); break;
+	case PARAM_HOLD_MS:          atomic_store(&p_hold_ms,      fclampf(v, 0.0f, 200.0f)); break;
+	case PARAM_KNEE_DB:          atomic_store(&p_knee_db,      fclampf(v, 0.0f, 30.0f)); break;
+	case PARAM_MAKEUP_DB:        atomic_store(&p_makeup_db,    fclampf(v, -12.0f, 18.0f)); break;
+	case PARAM_WET_DRY:          atomic_store(&p_wet_dry,      fclampf(v, 0.0f, 1.0f)); break;
+	case PARAM_RMS_WIN_MS:       atomic_store(&p_rms_win_ms,   fclampf(v, 10.0f, 2000.0f)); break;
+	case PARAM_SC_HPF_HZ:        atomic_store(&p_sc_hpf_hz,    fclampf(v, 20.0f, 500.0f)); break;
+	case PARAM_LOOKAHEAD_MS:     atomic_store(&p_lookahead_ms, fclampf(v, 0.0f, 20.0f)); break;
+	case PARAM_MAX_GAIN_DB:      atomic_store(&p_max_gain_db,  fclampf(v, 0.0f, 30.0f)); break;
+	case PARAM_DOWN_THRESHOLD:   atomic_store(&p_down_threshold, fclampf(v, -60.0f, 0.0f)); break;
+	case PARAM_DOWN_RATIO:       atomic_store(&p_down_ratio,   fclampf(v, 1.0f, 20.0f)); break;
+	case PARAM_ATMO_THRESHOLD:   atomic_store(&p_atmo_threshold, fclampf(v, -80.0f, 0.0f)); break;
+	case PARAM_ATMO_MAX_GAIN:    atomic_store(&p_atmo_max_gain,  fclampf(v, 0.0f, 30.0f)); break;
+	case PARAM_ATMO_KNEE:        atomic_store(&p_atmo_knee,      fclampf(v, 0.0f, 30.0f)); break;
+	case PARAM_DIALOG_THRESHOLD: atomic_store(&p_dialog_threshold, fclampf(v, -60.0f, 0.0f)); break;
+	case PARAM_DIALOG_MAX_GAIN:  atomic_store(&p_dialog_max_gain,  fclampf(v, 0.0f, 30.0f)); break;
+	case PARAM_DIALOG_KNEE:      atomic_store(&p_dialog_knee,      fclampf(v, 0.0f, 30.0f)); break;
+	case PARAM_NOISE_FLOOR_DB:   atomic_store(&p_noise_floor_db,   fclampf(v, -90.0f, -20.0f)); break;
+	case PARAM_NOISE_KNEE_DB:    atomic_store(&p_noise_knee_db,    fclampf(v, 0.0f, 30.0f)); break;
+	case PARAM_UPWARD_ATTACK_MS: atomic_store(&p_upward_attack_ms,  fclampf(v, 1.0f, 5000.0f)); break;
+	case PARAM_UPWARD_RELEASE_MS:atomic_store(&p_upward_release_ms, fclampf(v, 1.0f, 10000.0f)); break;
+	case PARAM_DUCK_ATTACK_MS:   atomic_store(&p_duck_attack_ms,    fclampf(v, 0.1f, 100.0f)); break;
+	case PARAM_DUCK_RELEASE_MS:  atomic_store(&p_duck_release_ms,   fclampf(v, 1.0f, 2000.0f)); break;
 	default: break;
 	}
 }
 
 int engine_get_param_i(engine_param_t id) {
 	switch (id) {
-	case PARAM_DETECTOR_MODE: return atomic_load(&p_detector_mode);
-	case PARAM_DOWNWARD_EN:   return atomic_load(&p_downward_en);
-	case PARAM_BYPASS:        return atomic_load(&p_bypass);
+	case PARAM_DETECTOR_MODE:     return atomic_load(&p_detector_mode);
+	case PARAM_DOWNWARD_EN:       return atomic_load(&p_downward_en);
+	case PARAM_BYPASS:            return atomic_load(&p_bypass);
+	case PARAM_ARCHITECTURE_MODE: return atomic_load(&p_architecture_mode);
 	default: return 0;
 	}
 }
 
 void engine_set_param_i(engine_param_t id, int v) {
 	switch (id) {
-	case PARAM_DETECTOR_MODE: atomic_store(&p_detector_mode, v ? 1 : 0); break;
-	case PARAM_DOWNWARD_EN:   atomic_store(&p_downward_en,   v ? 1 : 0); break;
-	case PARAM_BYPASS:        atomic_store(&p_bypass,        v ? 1 : 0); break;
+	case PARAM_DETECTOR_MODE: {
+		int x = v;
+		if (x < 0) x = 0; else if (x > 2) x = 2;
+		atomic_store(&p_detector_mode, x);
+		break;
+	}
+	case PARAM_DOWNWARD_EN:       atomic_store(&p_downward_en, v ? 1 : 0); break;
+	case PARAM_BYPASS:            atomic_store(&p_bypass,      v ? 1 : 0); break;
+	case PARAM_ARCHITECTURE_MODE: {
+		int x = v;
+		if (x < 0) x = 0; else if (x > 2) x = 2;
+		atomic_store(&p_architecture_mode, x);
+		break;
+	}
 	default: break;
 	}
 }
@@ -953,22 +1239,13 @@ void engine_read_meters(engine_meters_t *out) {
 }
 
 /* ----------------------- Presets ---------------------------------------
- * Three named slots. Factory defaults mirror Nicola's mpv compressor
- * profiles (LOW/MID/HIGH) but populate all 14 filmcomp float params plus
- * detector_mode + downward_en. MID matches the boot defaults above
- * (Wecker-getestet 2026-05-12). LOW is gentle (low ratio, sparingly
- * boost); HIGH is aggressive (more lift, lower threshold). */
-/* Factory-presets aligned to Nicola's tuning (2026-05-13, cinema-
- * verified on convolver against John-Wick double-shot, A-Quiet-Place
- * tinker scene, Wecker scene). All three share fast peak detection
- * (sc_hpf=20 catches LFE thumps in SC), 20ms lookahead, knee 6.1.
- *
- *   LOW  — konservativer Loudness-Lift mit Knee-Rolloff (Duck off).
- *          +5.7 dB Atmo, dialog +4, Action sanft gerundet.
- *   MID  — echte Dynamik-Range-Compression (Duck on -10/5:1).
- *          +10 dB Atmo, dialog +7.5, Action -5.6.
- *   HIGH — Dialog-Max (Lift bis Cap-Dialog) für arge Modern-Cinema-
- *          Dynamik. +14 dB Atmo+Dialog, Action -5.6. */
+ * Three named slots. Factory defaults mirror the aroio6 Buildroot package
+ * `state.go defaultFilmcompPreset()` cinema-tuning. MID is the boot
+ * default (Wecker-getestet + zonal-v2 plateau, 2026-05-15). All three
+ * share zonal-v2 architecture + Peak detector — they differ in the
+ * classic-stage params (threshold/ratio/release/max_gain/duck) which
+ * still feed when the user falls back to classic or v1 architecture
+ * via the header toggle. */
 static const engine_preset_t factory_presets[PRESET__COUNT] = {
 	[PRESET_LOW] = {
 		.f = {
@@ -977,7 +1254,7 @@ static const engine_preset_t factory_presets[PRESET__COUNT] = {
 			[PARAM_ATTACK_MS]    =  5.0f,
 			[PARAM_RELEASE_MS]   = 56.0f,
 			[PARAM_HOLD_MS]      =  0.0f,
-			[PARAM_KNEE_DB]      =  6.1f,
+			[PARAM_KNEE_DB]      = 16.5f,
 			[PARAM_MAKEUP_DB]    = -10.3f,
 			[PARAM_WET_DRY]      =  1.0f,
 			[PARAM_RMS_WIN_MS]   = 33.0f,
@@ -986,9 +1263,23 @@ static const engine_preset_t factory_presets[PRESET__COUNT] = {
 			[PARAM_MAX_GAIN_DB]  = 16.3f,
 			[PARAM_DOWN_THRESHOLD] = -6.0f,
 			[PARAM_DOWN_RATIO]   =  2.5f,
+			/* Zonal — shared across all three preset slots */
+			[PARAM_ATMO_THRESHOLD]   = -35.0f,
+			[PARAM_ATMO_MAX_GAIN]    =  24.0f,
+			[PARAM_ATMO_KNEE]        =  20.0f,
+			[PARAM_DIALOG_THRESHOLD] = -10.5f,
+			[PARAM_DIALOG_MAX_GAIN]  =  10.0f,
+			[PARAM_DIALOG_KNEE]      =  13.5f,
+			[PARAM_NOISE_FLOOR_DB]   = -70.5f,
+			[PARAM_NOISE_KNEE_DB]    =  10.5f,
+			[PARAM_UPWARD_ATTACK_MS] = 451.0f,
+			[PARAM_UPWARD_RELEASE_MS]=  20.0f,
+			[PARAM_DUCK_ATTACK_MS]   =   9.0f,
+			[PARAM_DUCK_RELEASE_MS]  =  51.0f,
 		},
-		.detector_mode = 1,
-		.downward_en   = 0,
+		.detector_mode     = 1,
+		.downward_en       = 0,
+		.architecture_mode = 2,
 	},
 	[PRESET_MID] = {
 		.f = {
@@ -997,7 +1288,7 @@ static const engine_preset_t factory_presets[PRESET__COUNT] = {
 			[PARAM_ATTACK_MS]    =  5.0f,
 			[PARAM_RELEASE_MS]   = 20.0f,
 			[PARAM_HOLD_MS]      =  0.0f,
-			[PARAM_KNEE_DB]      =  6.1f,
+			[PARAM_KNEE_DB]      = 16.5f,
 			[PARAM_MAKEUP_DB]    =  0.0f,
 			[PARAM_WET_DRY]      =  1.0f,
 			[PARAM_RMS_WIN_MS]   = 60.0f,
@@ -1006,29 +1297,55 @@ static const engine_preset_t factory_presets[PRESET__COUNT] = {
 			[PARAM_MAX_GAIN_DB]  = 10.0f,
 			[PARAM_DOWN_THRESHOLD] = -6.0f,
 			[PARAM_DOWN_RATIO]   =  4.0f,
+			[PARAM_ATMO_THRESHOLD]   = -35.0f,
+			[PARAM_ATMO_MAX_GAIN]    =  24.0f,
+			[PARAM_ATMO_KNEE]        =  20.0f,
+			[PARAM_DIALOG_THRESHOLD] = -10.5f,
+			[PARAM_DIALOG_MAX_GAIN]  =  10.0f,
+			[PARAM_DIALOG_KNEE]      =  13.5f,
+			[PARAM_NOISE_FLOOR_DB]   = -70.5f,
+			[PARAM_NOISE_KNEE_DB]    =  10.5f,
+			[PARAM_UPWARD_ATTACK_MS] = 451.0f,
+			[PARAM_UPWARD_RELEASE_MS]=  20.0f,
+			[PARAM_DUCK_ATTACK_MS]   =   9.0f,
+			[PARAM_DUCK_RELEASE_MS]  =  51.0f,
 		},
-		.detector_mode = 1,
-		.downward_en   = 1,
+		.detector_mode     = 1,
+		.downward_en       = 1,
+		.architecture_mode = 2,
 	},
 	[PRESET_HIGH] = {
 		.f = {
 			[PARAM_THRESHOLD]    = -10.0f,
 			[PARAM_RATIO]        =  6.0f,
 			[PARAM_ATTACK_MS]    =  5.0f,
-			[PARAM_RELEASE_MS]   = 20.0f,
+			[PARAM_RELEASE_MS]   = 800.0f,
 			[PARAM_HOLD_MS]      =  0.0f,
-			[PARAM_KNEE_DB]      =  6.1f,
+			[PARAM_KNEE_DB]      = 16.5f,
 			[PARAM_MAKEUP_DB]    =  0.0f,
 			[PARAM_WET_DRY]      =  1.0f,
-			[PARAM_RMS_WIN_MS]   = 60.0f,
+			[PARAM_RMS_WIN_MS]   = 50.0f,
 			[PARAM_SC_HPF_HZ]    = 20.0f,
 			[PARAM_LOOKAHEAD_MS] = 20.0f,
-			[PARAM_MAX_GAIN_DB]  = 14.0f,
-			[PARAM_DOWN_THRESHOLD] = -6.0f,
-			[PARAM_DOWN_RATIO]   =  4.0f,
+			[PARAM_MAX_GAIN_DB]  = 18.5f,
+			[PARAM_DOWN_THRESHOLD] = -14.0f,
+			[PARAM_DOWN_RATIO]   =  1.8f,
+			[PARAM_ATMO_THRESHOLD]   = -35.0f,
+			[PARAM_ATMO_MAX_GAIN]    =  24.0f,
+			[PARAM_ATMO_KNEE]        =  20.0f,
+			[PARAM_DIALOG_THRESHOLD] = -10.5f,
+			[PARAM_DIALOG_MAX_GAIN]  =  10.0f,
+			[PARAM_DIALOG_KNEE]      =  13.5f,
+			[PARAM_NOISE_FLOOR_DB]   = -70.5f,
+			[PARAM_NOISE_KNEE_DB]    =  10.5f,
+			[PARAM_UPWARD_ATTACK_MS] = 451.0f,
+			[PARAM_UPWARD_RELEASE_MS]=  20.0f,
+			[PARAM_DUCK_ATTACK_MS]   =   9.0f,
+			[PARAM_DUCK_RELEASE_MS]  =  51.0f,
 		},
-		.detector_mode = 1,
-		.downward_en   = 1,
+		.detector_mode     = 1,
+		.downward_en       = 1,
+		.architecture_mode = 2,
 	},
 };
 
@@ -1052,6 +1369,45 @@ const char *engine_preset_name(engine_preset_slot_t slot) {
 	return preset_names[slot];
 }
 
+/* backfill_zonal_defaults — pre-zonal artifact repair. A preset written by
+ * a pre-zonal binary always has architecture_mode==0 AND atmo_max_gain==0
+ * AND dialog_max_gain==0 (zonal fields never written). That's an artifact,
+ * not a deliberate Classic choice — restore the zonal architecture + zonal
+ * fields from the MID factory preset so applying it doesn't drag the UI
+ * into Classic with zeroed zonal params. Mirrors backfillZonalDefaults*()
+ * in the aroio6 backend (state.go). */
+static void backfill_zonal_defaults(engine_preset_t *p) {
+	if (!p) return;
+	if (p->f[PARAM_ATMO_MAX_GAIN] != 0.0f ||
+	    p->f[PARAM_DIALOG_MAX_GAIN] != 0.0f)
+		return;
+	const engine_preset_t *d = &factory_presets[PRESET_MID];
+	p->architecture_mode             = d->architecture_mode;
+	p->f[PARAM_ATMO_THRESHOLD]       = d->f[PARAM_ATMO_THRESHOLD];
+	p->f[PARAM_ATMO_MAX_GAIN]        = d->f[PARAM_ATMO_MAX_GAIN];
+	p->f[PARAM_ATMO_KNEE]            = d->f[PARAM_ATMO_KNEE];
+	p->f[PARAM_DIALOG_THRESHOLD]     = d->f[PARAM_DIALOG_THRESHOLD];
+	p->f[PARAM_DIALOG_MAX_GAIN]      = d->f[PARAM_DIALOG_MAX_GAIN];
+	p->f[PARAM_DIALOG_KNEE]          = d->f[PARAM_DIALOG_KNEE];
+	p->f[PARAM_NOISE_FLOOR_DB]       = d->f[PARAM_NOISE_FLOOR_DB];
+	p->f[PARAM_NOISE_KNEE_DB]        = d->f[PARAM_NOISE_KNEE_DB];
+	p->f[PARAM_UPWARD_ATTACK_MS]     = d->f[PARAM_UPWARD_ATTACK_MS];
+	p->f[PARAM_UPWARD_RELEASE_MS]    = d->f[PARAM_UPWARD_RELEASE_MS];
+	p->f[PARAM_DUCK_ATTACK_MS]       = d->f[PARAM_DUCK_ATTACK_MS];
+	p->f[PARAM_DUCK_RELEASE_MS]      = d->f[PARAM_DUCK_RELEASE_MS];
+}
+
+/* Push a snapshot into the live atomic params. Shared by slot- and
+ * named-preset apply. */
+static void preset_apply_live(const engine_preset_t *p) {
+	for (int i = 0; i < PARAM__FLOAT_COUNT; i++) {
+		engine_set_param_f((engine_param_t)i, p->f[i]);
+	}
+	engine_set_param_i(PARAM_DETECTOR_MODE,     p->detector_mode);
+	engine_set_param_i(PARAM_DOWNWARD_EN,       p->downward_en);
+	engine_set_param_i(PARAM_ARCHITECTURE_MODE, p->architecture_mode);
+}
+
 int engine_preset_apply(engine_preset_slot_t slot) {
 	if (slot < 0 || slot >= PRESET__COUNT) return -1;
 	preset_init_once();
@@ -1059,11 +1415,9 @@ int engine_preset_apply(engine_preset_slot_t slot) {
 	engine_preset_t p = presets[slot];
 	pthread_mutex_unlock(&preset_mtx);
 
-	for (int i = 0; i < PARAM__FLOAT_COUNT; i++) {
-		engine_set_param_f((engine_param_t)i, p.f[i]);
-	}
-	engine_set_param_i(PARAM_DETECTOR_MODE, p.detector_mode);
-	engine_set_param_i(PARAM_DOWNWARD_EN,   p.downward_en);
+	backfill_zonal_defaults(&p);
+	preset_apply_live(&p);
+	engine_named_set_active("");          /* slot + named are exclusive */
 	atomic_store(&active_preset_slot, (int)slot);
 	return 0;
 }
@@ -1075,8 +1429,9 @@ void engine_preset_save(engine_preset_slot_t slot) {
 	for (int i = 0; i < PARAM__FLOAT_COUNT; i++) {
 		p.f[i] = engine_get_param_f((engine_param_t)i);
 	}
-	p.detector_mode = engine_get_param_i(PARAM_DETECTOR_MODE);
-	p.downward_en   = engine_get_param_i(PARAM_DOWNWARD_EN);
+	p.detector_mode     = engine_get_param_i(PARAM_DETECTOR_MODE);
+	p.downward_en       = engine_get_param_i(PARAM_DOWNWARD_EN);
+	p.architecture_mode = engine_get_param_i(PARAM_ARCHITECTURE_MODE);
 
 	pthread_mutex_lock(&preset_mtx);
 	presets[slot] = p;
@@ -1109,4 +1464,164 @@ void engine_preset_set(engine_preset_slot_t slot, const engine_preset_t *in) {
 	pthread_mutex_lock(&preset_mtx);
 	presets[slot] = *in;
 	pthread_mutex_unlock(&preset_mtx);
+}
+
+/* ----------------------- Named presets --------------------------------- */
+/* Fixed-capacity array (C has no map). Kept sorted by name so the GUI
+ * dropdown order is stable. Guarded by named_mtx (sibling of preset_mtx).
+ * named_active mirrors the aroio6 backend's FilmcompActiveName. */
+
+typedef struct {
+	char            name[ENGINE_NAME_LEN];
+	engine_preset_t p;
+} named_preset_t;
+
+static named_preset_t  named_presets[ENGINE_NAMED_MAX];
+static int             named_count_v = 0;
+static char            named_active[ENGINE_NAME_LEN] = "";
+static pthread_mutex_t named_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+/* Linear search; returns index or -1. Caller holds named_mtx. */
+static int named_find_locked(const char *name) {
+	for (int i = 0; i < named_count_v; i++) {
+		if (strcmp(named_presets[i].name, name) == 0) return i;
+	}
+	return -1;
+}
+
+/* Insertion sort by name. Caller holds named_mtx. */
+static void named_sort_locked(void) {
+	for (int i = 1; i < named_count_v; i++) {
+		named_preset_t tmp = named_presets[i];
+		int j = i - 1;
+		while (j >= 0 && strcmp(named_presets[j].name, tmp.name) > 0) {
+			named_presets[j + 1] = named_presets[j];
+			j--;
+		}
+		named_presets[j + 1] = tmp;
+	}
+}
+
+int engine_named_count(void) {
+	pthread_mutex_lock(&named_mtx);
+	int n = named_count_v;
+	pthread_mutex_unlock(&named_mtx);
+	return n;
+}
+
+const char *engine_named_name(int idx) {
+	/* Returned pointer stays valid until the next mutating call; the GUI
+	 * copies it immediately into combo entries, so this is fine for the
+	 * single-threaded ImGui draw path. */
+	static char buf[ENGINE_NAME_LEN];
+	pthread_mutex_lock(&named_mtx);
+	if (idx < 0 || idx >= named_count_v) {
+		pthread_mutex_unlock(&named_mtx);
+		return "";
+	}
+	snprintf(buf, sizeof(buf), "%s", named_presets[idx].name);
+	pthread_mutex_unlock(&named_mtx);
+	return buf;
+}
+
+int engine_named_get(const char *name, engine_preset_t *out) {
+	if (!name || !*name || !out) return -1;
+	pthread_mutex_lock(&named_mtx);
+	int i = named_find_locked(name);
+	if (i < 0) { pthread_mutex_unlock(&named_mtx); return -1; }
+	*out = named_presets[i].p;
+	pthread_mutex_unlock(&named_mtx);
+	backfill_zonal_defaults(out);
+	return 0;
+}
+
+int engine_named_save(const char *name) {
+	if (!name || !*name) return -1;
+	preset_init_once();
+
+	/* Snapshot the current live params (same logic as engine_preset_save). */
+	engine_preset_t p;
+	for (int i = 0; i < PARAM__FLOAT_COUNT; i++) {
+		p.f[i] = engine_get_param_f((engine_param_t)i);
+	}
+	p.detector_mode     = engine_get_param_i(PARAM_DETECTOR_MODE);
+	p.downward_en       = engine_get_param_i(PARAM_DOWNWARD_EN);
+	p.architecture_mode = engine_get_param_i(PARAM_ARCHITECTURE_MODE);
+
+	pthread_mutex_lock(&named_mtx);
+	int i = named_find_locked(name);
+	if (i >= 0) {
+		named_presets[i].p = p;                 /* overwrite */
+	} else {
+		if (named_count_v >= ENGINE_NAMED_MAX) {
+			pthread_mutex_unlock(&named_mtx);
+			return -1;                          /* library full */
+		}
+		i = named_count_v++;
+		snprintf(named_presets[i].name, ENGINE_NAME_LEN, "%s", name);
+		named_presets[i].p = p;
+		named_sort_locked();
+	}
+	snprintf(named_active, ENGINE_NAME_LEN, "%s", name);
+	pthread_mutex_unlock(&named_mtx);
+	atomic_store(&active_preset_slot, -1);      /* slot + named exclusive */
+	return 0;
+}
+
+void engine_named_set(const char *name, const engine_preset_t *in) {
+	if (!name || !*name || !in) return;
+	pthread_mutex_lock(&named_mtx);
+	int i = named_find_locked(name);
+	if (i >= 0) {
+		named_presets[i].p = *in;               /* overwrite */
+	} else {
+		if (named_count_v >= ENGINE_NAMED_MAX) {
+			pthread_mutex_unlock(&named_mtx);
+			return;                             /* library full */
+		}
+		i = named_count_v++;
+		snprintf(named_presets[i].name, ENGINE_NAME_LEN, "%s", name);
+		named_presets[i].p = *in;
+		named_sort_locked();
+	}
+	pthread_mutex_unlock(&named_mtx);
+}
+
+int engine_named_delete(const char *name) {
+	if (!name || !*name) return 0;
+	pthread_mutex_lock(&named_mtx);
+	int i = named_find_locked(name);
+	if (i < 0) { pthread_mutex_unlock(&named_mtx); return 0; }
+	for (int j = i; j < named_count_v - 1; j++)
+		named_presets[j] = named_presets[j + 1];
+	named_count_v--;
+	if (strcmp(named_active, name) == 0) named_active[0] = '\0';
+	pthread_mutex_unlock(&named_mtx);
+	return 1;
+}
+
+int engine_named_apply(const char *name) {
+	engine_preset_t p;
+	if (engine_named_get(name, &p) != 0) return -1;  /* backfill done inside */
+	preset_apply_live(&p);
+	atomic_store(&active_preset_slot, -1);            /* clear fixed slot */
+	pthread_mutex_lock(&named_mtx);
+	snprintf(named_active, ENGINE_NAME_LEN, "%s", name);
+	pthread_mutex_unlock(&named_mtx);
+	return 0;
+}
+
+const char *engine_named_active(void) {
+	static char buf[ENGINE_NAME_LEN];
+	pthread_mutex_lock(&named_mtx);
+	snprintf(buf, sizeof(buf), "%s", named_active);
+	pthread_mutex_unlock(&named_mtx);
+	return buf;
+}
+
+void engine_named_set_active(const char *name) {
+	pthread_mutex_lock(&named_mtx);
+	if (name && *name) snprintf(named_active, ENGINE_NAME_LEN, "%s", name);
+	else               named_active[0] = '\0';
+	pthread_mutex_unlock(&named_mtx);
 }

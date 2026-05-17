@@ -1,4 +1,4 @@
-# aroio_filmcomp standalone build
+# filmcomp standalone build
 #
 # Builds a single-binary native GUI app: GLFW+OpenGL window with
 # Dear ImGui control surface, JACK audio engine + OSC server in the
@@ -10,8 +10,8 @@
 #   On Arch:
 #     pacman -S base-devel pkgconf jack2 glfw mesa
 #
-# Run:  ./aroio_filmcomp
-#        ./aroio_filmcomp --name comp2 --osc 14042   # second instance
+# Run:  ./filmcomp
+#        ./filmcomp --name comp2 --osc 14042   # second instance
 
 CC      ?= gcc
 CXX     ?= g++
@@ -41,7 +41,7 @@ GUI_OBJ    := src/gui.o
 
 ALL_OBJ := $(ENGINE_OBJ) $(GUI_OBJ) $(IMGUI_OBJ)
 
-TARGET := aroio_filmcomp
+TARGET := filmcomp
 
 all: $(TARGET)
 

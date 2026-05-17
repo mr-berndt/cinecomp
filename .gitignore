@@ -1,3 +1,5 @@
-aroio_filmcomp
+filmcomp
 *.o
 dist/
+.ccache/
+imgui.ini

@@ -1,7 +1,7 @@
 #!/bin/bash
-# Build a .deb package for aroio_filmcomp standalone.
+# Build a .deb package for the filmcomp standalone.
 #
-# Output: dist/aroio-filmcomp_<version>_amd64.deb
+# Output: dist/filmcomp_<version>_amd64.deb
 #
 # Run as user (no sudo needed). Builds inside the existing aroio6
 # docker container so the host doesn't need libjack/glfw dev pkgs.
@@ -9,18 +9,18 @@
 # invoke this directly outside Docker:  BUILD_NATIVE=1 ./build-deb.sh
 set -euo pipefail
 
-VERSION="${VERSION:-1.0.0}"
+VERSION="${VERSION:-1.1.0}"
 PKGROOT="$(dirname "$(readlink -f "$0")")"
 cd "$PKGROOT"
 
 DIST="$PKGROOT/dist"
 STAGE="$PKGROOT/dist/stage"
-DEB="$DIST/aroio-filmcomp_${VERSION}_amd64.deb"
+DEB="$DIST/filmcomp_${VERSION}_amd64.deb"
 
 rm -rf "$STAGE"
 mkdir -p "$DIST" "$STAGE/usr/local/bin" "$STAGE/DEBIAN" \
          "$STAGE/usr/share/applications" \
-         "$STAGE/usr/share/doc/aroio-filmcomp"
+         "$STAGE/usr/share/doc/filmcomp"
 
 # --- Build the binary ---------------------------------------------------------
 if [[ "${BUILD_NATIVE:-0}" == "1" ]]; then
@@ -35,22 +35,22 @@ else
             apt-get update -qq >/dev/null &&
             apt-get install -y -qq build-essential libjack-jackd2-dev libglfw3-dev libgl-dev pkg-config >/dev/null &&
             cd /build && make clean && make &&
-            chown $(id -u):$(id -g) aroio_filmcomp src/*.o vendor/imgui/*.o vendor/imgui/backends/*.o 2>/dev/null || true
+            chown $(id -u):$(id -g) filmcomp src/*.o vendor/imgui/*.o vendor/imgui/backends/*.o 2>/dev/null || true
         "
 fi
 
 # --- Stage files --------------------------------------------------------------
-install -m 0755 aroio_filmcomp "$STAGE/usr/local/bin/aroio_filmcomp"
-install -m 0644 README.md      "$STAGE/usr/share/doc/aroio-filmcomp/README.md"
+install -m 0755 filmcomp        "$STAGE/usr/local/bin/filmcomp"
+install -m 0644 README.md       "$STAGE/usr/share/doc/filmcomp/README.md"
 
 # Desktop entry so DAWs / file managers / app launchers see it.
-cat > "$STAGE/usr/share/applications/aroio-filmcomp.desktop" <<EOF
+cat > "$STAGE/usr/share/applications/filmcomp.desktop" <<EOF
 [Desktop Entry]
 Type=Application
-Name=aroio_filmcomp
+Name=filmcomp
 GenericName=Upward Compressor for Film
 Comment=JACK-based upward dynamic range compressor for film playback
-Exec=/usr/local/bin/aroio_filmcomp
+Exec=/usr/local/bin/filmcomp
 Icon=audio-x-generic
 Terminal=false
 Categories=AudioVideo;Audio;
@@ -60,7 +60,7 @@ EOF
 # --- Control file -------------------------------------------------------------
 SIZE_KB=$(du -sk "$STAGE" | cut -f1)
 cat > "$STAGE/DEBIAN/control" <<EOF
-Package: aroio-filmcomp
+Package: filmcomp
 Version: $VERSION
 Section: sound
 Priority: optional
@@ -68,16 +68,19 @@ Architecture: amd64
 Installed-Size: $SIZE_KB
 Depends: libjack-jackd2-0 | libjack0, libglfw3, libgl1
 Maintainer: Abacus Electronics <avm-project@humboldtforum.org>
-Description: aroio_filmcomp — Upward compressor for film playback
+Description: filmcomp — Upward compressor for film playback
  Self-contained JACK client with native Dear ImGui control surface.
  Lifts quiet program material (dialog, ambience) without touching loud
  transients. Layout-agnostic 8-channel side-chain detection (Stereo,
  5.1, 7.1 all work without configuration). Peak detector with
  configurable lookahead so transients pass through cleanly.
  .
- Mid preset (default on first run) is tuned against film material with
- isolated transients (gunshots, alarm clocks over quiet atmo). Settings
- persist to \$XDG_CONFIG_HOME/aroio_filmcomp/state.ini.
+ Three architecture modes: classic single-stage; zonal v1 (summed
+ atmo + dialog upward stages); zonal v2 (band-shaped plateaus, default
+ since 2026-05-15 — pump-resistant on real cinema material).
+ .
+ Originated as the engine of the aroio6 Buildroot package
+ \`aroio_filmcomp\`. Settings persist to \$XDG_CONFIG_HOME/filmcomp/state.ini.
 EOF
 
 # --- Build the .deb -----------------------------------------------------------
