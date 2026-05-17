@@ -172,7 +172,7 @@ static _Atomic float p_atmo_knee         =  20.0f;
 static _Atomic float p_dialog_threshold  = -10.5f;
 static _Atomic float p_dialog_max_gain   =  10.0f;
 static _Atomic float p_dialog_knee       =  13.5f;
-static _Atomic float p_noise_floor_db    = -70.5f;
+static _Atomic float p_noise_floor_db    = -80.0f; /* fixed guard, not in GUI */
 static _Atomic float p_noise_knee_db     =  10.5f;
 static _Atomic float p_upward_attack_ms  = 451.0f; /* slow rise — pause-pump guard */
 static _Atomic float p_upward_release_ms =  20.0f; /* fast fall — no transient amp */
@@ -1242,10 +1242,9 @@ void engine_read_meters(engine_meters_t *out) {
  * Three named slots. Factory defaults mirror the aroio6 Buildroot package
  * `state.go defaultFilmcompPreset()` cinema-tuning. MID is the boot
  * default (Wecker-getestet + zonal-v2 plateau, 2026-05-15). All three
- * share zonal-v2 architecture + Peak detector — they differ in the
- * classic-stage params (threshold/ratio/release/max_gain/duck) which
- * still feed when the user falls back to classic or v1 architecture
- * via the header toggle. */
+ * use zonal-v2 architecture + Peak detector. Classic/v1 are retired and
+ * no longer reachable from the GUI; the classic-stage params are kept
+ * only so the OSC API and old state files stay loadable. */
 static const engine_preset_t factory_presets[PRESET__COUNT] = {
 	[PRESET_LOW] = {
 		.f = {
@@ -1270,7 +1269,7 @@ static const engine_preset_t factory_presets[PRESET__COUNT] = {
 			[PARAM_DIALOG_THRESHOLD] = -10.5f,
 			[PARAM_DIALOG_MAX_GAIN]  =  10.0f,
 			[PARAM_DIALOG_KNEE]      =  13.5f,
-			[PARAM_NOISE_FLOOR_DB]   = -70.5f,
+			[PARAM_NOISE_FLOOR_DB]   = -80.0f,
 			[PARAM_NOISE_KNEE_DB]    =  10.5f,
 			[PARAM_UPWARD_ATTACK_MS] = 451.0f,
 			[PARAM_UPWARD_RELEASE_MS]=  20.0f,
@@ -1303,7 +1302,7 @@ static const engine_preset_t factory_presets[PRESET__COUNT] = {
 			[PARAM_DIALOG_THRESHOLD] = -10.5f,
 			[PARAM_DIALOG_MAX_GAIN]  =  10.0f,
 			[PARAM_DIALOG_KNEE]      =  13.5f,
-			[PARAM_NOISE_FLOOR_DB]   = -70.5f,
+			[PARAM_NOISE_FLOOR_DB]   = -80.0f,
 			[PARAM_NOISE_KNEE_DB]    =  10.5f,
 			[PARAM_UPWARD_ATTACK_MS] = 451.0f,
 			[PARAM_UPWARD_RELEASE_MS]=  20.0f,
@@ -1336,7 +1335,7 @@ static const engine_preset_t factory_presets[PRESET__COUNT] = {
 			[PARAM_DIALOG_THRESHOLD] = -10.5f,
 			[PARAM_DIALOG_MAX_GAIN]  =  10.0f,
 			[PARAM_DIALOG_KNEE]      =  13.5f,
-			[PARAM_NOISE_FLOOR_DB]   = -70.5f,
+			[PARAM_NOISE_FLOOR_DB]   = -80.0f,
 			[PARAM_NOISE_KNEE_DB]    =  10.5f,
 			[PARAM_UPWARD_ATTACK_MS] = 451.0f,
 			[PARAM_UPWARD_RELEASE_MS]=  20.0f,

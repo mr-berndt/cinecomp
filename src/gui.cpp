@@ -3,7 +3,7 @@
  *
  * 2x2 main layout (v2 architecture), matching the aroio6 web UI:
  *
- *   ┌─ Header (title / architecture / detector / bypass / presets) ─┐
+ *   ┌─ Header (title / presets · detector / bypass) ───────────────┐
  *   ├──────────────────────────────────┬────────────────────────────┤
  *   │ Gain-vs-SC curve                 │ Combined meter block:      │
  *   │ (plateau shape, live SC marker)  │  GR-bar + SC/Gain readout  │
@@ -738,6 +738,13 @@ int main(int argc, char **argv) {
     }
     state_load(opts.state_path);
 
+    // Architecture is fixed to zonal v2 (Classic/v1 retired) and the Dual
+    // detector was removed. Clamp any stale state.ini back to the supported
+    // set so an old file can't resurrect a dead mode.
+    engine_set_param_i(PARAM_ARCHITECTURE_MODE, 2);
+    if (engine_get_param_i(PARAM_DETECTOR_MODE) == 2)
+        engine_set_param_i(PARAM_DETECTOR_MODE, 1);
+
     glfwSetErrorCallback([](int e, const char *m){ std::fprintf(stderr, "glfw: %d %s\n", e, m); });
     if (!glfwInit()) { engine_stop(); return 1; }
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
@@ -840,7 +847,7 @@ int main(int argc, char **argv) {
             }
         }
 
-        int arch_mode = engine_get_param_i(PARAM_ARCHITECTURE_MODE);
+        const int arch_mode = 2;   // fixed: Classic/v1 retired, v2 only
         int det_mode  = engine_get_param_i(PARAM_DETECTOR_MODE);
         int active    = engine_preset_active();
 
@@ -945,35 +952,19 @@ int main(int argc, char **argv) {
             ImGui::EndDisabled();
             ImGui::PopStyleVar();
 
-            // Second header line, left-aligned. Right-anchoring this
-            // cluster at (window_width - 400) pushed Bypass off-screen on
-            // narrow windows (notebook) — so it gets its own row instead.
+            // Second header line, left-aligned. Architecture is fixed to
+            // zonal v2 (Classic/v1 retired), so only the detector mode and
+            // bypass remain here.
             ImGui::Spacing();
-            // Architecture toggle (Classic/v1/v2)
-            const char *arch_names[3] = { "Classic", "v1", "v2" };
-            ImGui::TextColored(clr::text_sand, "Arch"); ImGui::SameLine();
-            for (int i = 0; i < 3; i++) {
-                if (i > 0) ImGui::SameLine();
-                if (seg_button(arch_names[i], arch_mode == i, ImVec2(56, 24),
-                               clr::atmo_purple)) {
-                    engine_set_param_i(PARAM_ARCHITECTURE_MODE, i);
-                    mark_dirty();
-                }
-            }
-            ImGui::SameLine(0, 10);
             ImGui::TextColored(clr::text_sand, "Det"); ImGui::SameLine();
-            const char *det_names[3] = { "RMS", "Peak", "Dual" };
-            for (int i = 0; i < 3; i++) {
+            const char *det_names[2] = { "RMS", "Peak" };
+            for (int i = 0; i < 2; i++) {
                 if (i > 0) ImGui::SameLine();
-                // Dual only meaningful in zonal modes
-                bool disable = (i == 2 && arch_mode == 0);
-                ImGui::BeginDisabled(disable);
                 if (seg_button(det_names[i], det_mode == i, ImVec2(46, 24),
                                clr::mint)) {
                     engine_set_param_i(PARAM_DETECTOR_MODE, i);
                     mark_dirty();
                 }
-                ImGui::EndDisabled();
             }
             ImGui::SameLine(0, 10);
             bool bp = engine_get_param_i(PARAM_BYPASS) != 0;
@@ -1021,8 +1012,10 @@ int main(int argc, char **argv) {
             float peak_col_w = avail_w - left_col_w - gap_col;
             if (peak_col_w < 100) peak_col_w = 100;
 
-            // Title row
-            ImGui::TextColored(clr::text_sand, "Gain Reduction / Lift");
+            // Title row. The left caption has to fit the narrow GR-bar
+            // column (left_col_w) — a long string here ran straight into
+            // the channel-peaks caption, so keep it short.
+            ImGui::TextColored(clr::text_sand, "GR / Lift");
             ImGui::SameLine(left_col_w + gap_col);
             ImGui::TextColored(clr::text_sand, "Channel Peaks (in / out)");
 
@@ -1088,105 +1081,44 @@ int main(int argc, char **argv) {
         {
             ImGui::TextColored(clr::text_sand, "UPWARD");
             ImGui::SameLine();
-            if (arch_mode == 0) {
-                ImGui::TextDisabled("(classic single-stage)");
-            } else if (arch_mode == 1) {
-                ImGui::TextDisabled("(zonal v1 - summed stages)");
-            } else {
-                ImGui::TextDisabled("(zonal v2 - band plateaus)");
-            }
+            ImGui::TextDisabled("(band plateaus — atmo / dialog)");
             ImGui::Separator();
 
-            // 3 columns: Atmo, Dialog, Envelope. Heights match.
-            // When arch_mode == 0, swap atmo/dialog cols for classic
-            // single-stage (threshold/ratio/knee in col1, max_gain & makeup
-            // in col2, attack/release in col3).
+            // 3 columns: Atmo | Dialog | Envelope. Heights match.
             ImGui::Columns(3, "##upcols", false);
 
-            if (arch_mode == 0) {
-                // Col 1: classic single stage
-                static const KnobDesc CLA1[] = {
-                    {"Threshold",  PARAM_THRESHOLD,  -60.0f, 0.0f, "%.1f dB"},
-                    {"Ratio",      PARAM_RATIO,        1.0f, 20.0f, "%.1f:1"},
-                    {"Knee",       PARAM_KNEE_DB,      0.0f, 30.0f, "%.1f dB"},
-                };
-                for (int i = 0; i < 3; i++) {
-                    if (labeled_slider(CLA1[i], 10 + i)) mark_dirty();
-                    ImGui::Spacing();
-                }
-                ImGui::NextColumn();
-                // Col 2: max gain / makeup / wet-dry
-                static const KnobDesc CLA2[] = {
-                    {"Max Gain",   PARAM_MAX_GAIN_DB,  0.0f, 30.0f, "%.1f dB"},
-                    {"Makeup",     PARAM_MAKEUP_DB,  -12.0f, 18.0f, "%.1f dB"},
-                    {"Wet/Dry",    PARAM_WET_DRY,      0.0f,  1.0f, "%.2f"},
-                };
-                for (int i = 0; i < 3; i++) {
-                    if (labeled_slider(CLA2[i], 20 + i)) mark_dirty();
-                    ImGui::Spacing();
-                }
-                ImGui::NextColumn();
-                // Col 3: attack/release/hold
-                static const KnobDesc CLA3[] = {
-                    {"Attack",     PARAM_ATTACK_MS,    1.0f, 200.0f, "%.0f ms"},
-                    {"Release",    PARAM_RELEASE_MS,  10.0f, 2000.0f, "%.0f ms"},
-                    {"Hold",       PARAM_HOLD_MS,      0.0f, 200.0f, "%.0f ms"},
-                };
-                for (int i = 0; i < 3; i++) {
-                    if (labeled_slider(CLA3[i], 30 + i)) mark_dirty();
-                    ImGui::Spacing();
-                }
-            } else {
-                // Zonal v1/v2: Atmo | Dialog | Envelope
-                static const KnobDesc ATMO_KNOBS[] = {
-                    {"Atmo Lift",  PARAM_ATMO_MAX_GAIN,   0.0f, 30.0f, "%.1f dB"},
-                    {"Atmo Thr",   PARAM_ATMO_THRESHOLD, -80.0f, 0.0f, "%.1f dB"},
-                    {"Atmo Knee",  PARAM_ATMO_KNEE,       0.0f, 30.0f, "%.1f dB"},
-                };
-                for (int i = 0; i < 3; i++) {
-                    if (labeled_slider(ATMO_KNOBS[i], 100 + i)) mark_dirty();
-                    ImGui::Spacing();
-                }
-                ImGui::NextColumn();
-                static const KnobDesc DIAL_KNOBS[] = {
-                    {"Dialog Lift", PARAM_DIALOG_MAX_GAIN,   0.0f, 30.0f, "%.1f dB"},
-                    {"Dialog Thr",  PARAM_DIALOG_THRESHOLD, -60.0f, 0.0f, "%.1f dB"},
-                    {"Dialog Knee", PARAM_DIALOG_KNEE,       0.0f, 30.0f, "%.1f dB"},
-                };
-                for (int i = 0; i < 3; i++) {
-                    if (labeled_slider(DIAL_KNOBS[i], 110 + i)) mark_dirty();
-                    ImGui::Spacing();
-                }
-                ImGui::NextColumn();
-                static const KnobDesc ENV_KNOBS[] = {
-                    {"Attack",     PARAM_UPWARD_ATTACK_MS,   1.0f, 5000.0f, "%.0f ms"},
-                    {"Release",    PARAM_UPWARD_RELEASE_MS,  1.0f, 10000.0f, "%.0f ms"},
-                };
-                for (int i = 0; i < 2; i++) {
-                    if (labeled_slider(ENV_KNOBS[i], 120 + i)) mark_dirty();
-                    ImGui::Spacing();
-                }
-                // Empty third cell — keep alignment clean
+            static const KnobDesc ATMO_KNOBS[] = {
+                {"Atmo Lift",  PARAM_ATMO_MAX_GAIN,   0.0f, 30.0f, "%.1f dB"},
+                {"Atmo Thr",   PARAM_ATMO_THRESHOLD, -80.0f, 0.0f, "%.1f dB"},
+                {"Atmo Knee",  PARAM_ATMO_KNEE,       0.0f, 30.0f, "%.1f dB"},
+            };
+            for (int i = 0; i < 3; i++) {
+                if (labeled_slider(ATMO_KNOBS[i], 100 + i)) mark_dirty();
+                ImGui::Spacing();
             }
+            ImGui::NextColumn();
+            static const KnobDesc DIAL_KNOBS[] = {
+                {"Dialog Lift", PARAM_DIALOG_MAX_GAIN,   0.0f, 30.0f, "%.1f dB"},
+                {"Dialog Thr",  PARAM_DIALOG_THRESHOLD, -60.0f, 0.0f, "%.1f dB"},
+                {"Dialog Knee", PARAM_DIALOG_KNEE,       0.0f, 30.0f, "%.1f dB"},
+            };
+            for (int i = 0; i < 3; i++) {
+                if (labeled_slider(DIAL_KNOBS[i], 110 + i)) mark_dirty();
+                ImGui::Spacing();
+            }
+            ImGui::NextColumn();
+            static const KnobDesc ENV_KNOBS[] = {
+                {"Attack",     PARAM_UPWARD_ATTACK_MS,   1.0f, 5000.0f, "%.0f ms"},
+                {"Release",    PARAM_UPWARD_RELEASE_MS,  1.0f, 10000.0f, "%.0f ms"},
+            };
+            for (int i = 0; i < 2; i++) {
+                if (labeled_slider(ENV_KNOBS[i], 120 + i)) mark_dirty();
+                ImGui::Spacing();
+            }
+            // Empty third cell — keep alignment clean
             ImGui::Columns(1);
-
-            // Noise-floor sub-row (zonal only)
-            if (arch_mode != 0) {
-                ImGui::Separator();
-                ImGui::TextColored(clr::text_sand, "NOISE FLOOR");
-                ImGui::SameLine();
-                ImGui::TextDisabled("(atmo creep guard)");
-                ImGui::Columns(2, "##nfcols", false);
-                static const KnobDesc NF_KNOBS[] = {
-                    {"NF dB",    PARAM_NOISE_FLOOR_DB, -90.0f, -20.0f, "%.1f dB"},
-                    {"NF Knee",  PARAM_NOISE_KNEE_DB,    0.0f,  30.0f, "%.1f dB"},
-                };
-                for (int i = 0; i < 2; i++) {
-                    if (labeled_slider(NF_KNOBS[i], 130 + i)) mark_dirty();
-                    ImGui::NextColumn();
-                }
-                ImGui::Columns(1);
-            }
+            // Noise floor + knee are fixed internal guards (floor -80 dB,
+            // below the activity floor) — deliberately not exposed.
         }
         ImGui::EndChild();
 
@@ -1223,44 +1155,32 @@ int main(int argc, char **argv) {
             ImGui::Columns(1);
             ImGui::Spacing();
 
-            // Row 2: attack / release (zonal envelopes for duck)
-            if (arch_mode != 0) {
-                ImGui::Columns(2, "##dnrow2", false);
-                static const KnobDesc DN_ROW2[] = {
-                    {"Attack",  PARAM_DUCK_ATTACK_MS,  0.1f, 100.0f,  "%.1f ms"},
-                    {"Release", PARAM_DUCK_RELEASE_MS, 1.0f, 2000.0f, "%.0f ms"},
-                };
-                for (int i = 0; i < 2; i++) {
-                    if (labeled_slider(DN_ROW2[i], 210 + i)) mark_dirty();
-                    ImGui::NextColumn();
-                }
-                ImGui::Columns(1);
+            // Row 2: duck attack / release
+            ImGui::Columns(2, "##dnrow2", false);
+            static const KnobDesc DN_ROW2[] = {
+                {"Attack",  PARAM_DUCK_ATTACK_MS,  0.1f, 100.0f,  "%.1f ms"},
+                {"Release", PARAM_DUCK_RELEASE_MS, 1.0f, 2000.0f, "%.0f ms"},
+            };
+            for (int i = 0; i < 2; i++) {
+                if (labeled_slider(DN_ROW2[i], 210 + i)) mark_dirty();
+                ImGui::NextColumn();
             }
+            ImGui::Columns(1);
             ImGui::EndDisabled();
 
             ImGui::Spacing();
             ImGui::Separator();
             ImGui::TextColored(clr::text_sand, "GLOBAL");
             ImGui::Columns(3, "##globalrow", false);
-            // Makeup + RMS window + SC HPF
+            // Makeup + side-chain decay + wet/dry. SC-HPF, lookahead and
+            // the noise-floor guard are fixed internals — not exposed.
             static const KnobDesc GLB_KNOBS[] = {
-                {"Makeup",   PARAM_MAKEUP_DB,   -12.0f, 18.0f,  "%.1f dB"},
+                {"Makeup",   PARAM_MAKEUP_DB,   -12.0f, 18.0f,   "%.1f dB"},
                 {"SC Decay", PARAM_RMS_WIN_MS,   10.0f, 2000.0f, "%.0f ms"},
-                {"SC HPF",   PARAM_SC_HPF_HZ,    20.0f, 500.0f,  "%.0f Hz"},
+                {"Wet/Dry",  PARAM_WET_DRY,       0.0f, 1.0f,    "%.2f"},
             };
             for (int i = 0; i < 3; i++) {
                 if (labeled_slider(GLB_KNOBS[i], 220 + i)) mark_dirty();
-                ImGui::NextColumn();
-            }
-            ImGui::Columns(1);
-            // Lookahead / Wet-Dry
-            ImGui::Columns(2, "##globalrow2", false);
-            static const KnobDesc GLB2[] = {
-                {"Lookahead", PARAM_LOOKAHEAD_MS, 0.0f, 20.0f, "%.1f ms"},
-                {"Wet/Dry",   PARAM_WET_DRY,      0.0f, 1.0f,  "%.2f"},
-            };
-            for (int i = 0; i < 2; i++) {
-                if (labeled_slider(GLB2[i], 230 + i)) mark_dirty();
                 ImGui::NextColumn();
             }
             ImGui::Columns(1);

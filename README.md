@@ -158,13 +158,17 @@ on exit. The standalone build **processes by default** (bypass off) —
 you install it to use it. The Bypass toggle (top header row) switches to
 delay-matched pass-through.
 
-## Architecture modes
+## Architecture
 
-| Mode | Topology |
-|---|---|
-| **Classic** | One upward stage + duck (classic compressor) |
-| **Zonal v1** | Summed atmo + dialogue upward stages + duck |
-| **Zonal v2** | Band-shaped plateaus per zone + asymmetric envelope — **default** |
+filmcomp uses a single topology: **zonal v2** — band-shaped gain
+plateaus per zone, an asymmetric upward envelope, and a soft-knee duck
+on top. That is the whole product; there is nothing to pick.
+
+Two earlier prototypes — *Classic* (one upward stage + duck) and
+*Zonal v1* (summed atmo + dialogue stages + duck) — are retired. They
+are no longer reachable from the GUI; the engine still accepts the old
+`/filmcomp/architecture` OSC value only so that legacy state files keep
+loading.
 
 The v2 plateau topology is verified on hard cinema test scenes (the
 John Wick double-shot, the A-Quiet-Place alarm-clock and tinkering
@@ -180,9 +184,13 @@ in_L  in_R  in_C  in_LFE  in_LS  in_RS  in_RBL  in_RBR
 out_L out_R out_C out_LFE out_LS out_RS out_RBL out_RBR
 ```
 
-Layout-agnostic via smooth per-channel weights: silent ports are kept
-out of the detection automatically. For a stereo workflow just wire
-`in_L`/`in_R` (and `out_L`/`out_R`); leave the rest open.
+**No per-layout configuration.** filmcomp is layout-agnostic via smooth
+per-channel weights: silent ports are automatically kept out of the
+detection, so the *same* settings work unchanged from plain 2.0 stereo
+through 5.1 right up to 7.1 — you never tell it which layout you have.
+Just wire the channels you actually use (for stereo only `in_L`/`in_R`
+and `out_L`/`out_R`) and leave the rest open; the active channels are
+detected and the unused ones ignored.
 
 ## Presets
 
@@ -199,20 +207,19 @@ this engine). Main controls:
 
 ```
 /filmcomp/bypass i             — 0/1
-/filmcomp/architecture i       — 0=Classic, 1=v1, 2=v2
-/filmcomp/detector i           — 0=RMS, 1=Peak, 2=Dual (zonal only)
+/filmcomp/detector i           — 0=RMS, 1=Peak   (Dual retired)
+/filmcomp/architecture i       — legacy/compat only; engine runs v2
 
-# Classic stage
-/filmcomp/threshold f          — dB (-60..0)
-/filmcomp/ratio f              — 1..20
-/filmcomp/max_gain f           — dB (0..30)
-
-# Zonal stages (v1 + v2)
+# Zonal stages (the live topology)
 /filmcomp/atmo/threshold f     /filmcomp/atmo/max_gain f    /filmcomp/atmo/knee f
 /filmcomp/dialog/threshold f   /filmcomp/dialog/max_gain f  /filmcomp/dialog/knee f
-/filmcomp/noise/floor f        /filmcomp/noise/knee f
 /filmcomp/upward/attack_ms f   /filmcomp/upward/release_ms f
 /filmcomp/duck/attack_ms f     /filmcomp/duck/release_ms f
+
+# Legacy classic-stage paths — still accepted, but ignored under v2
+/filmcomp/threshold f   /filmcomp/ratio f   /filmcomp/max_gain f
+# Fixed internal guards — accepted for compat, not user-facing
+/filmcomp/noise/floor f        /filmcomp/noise/knee f
 
 # Presets
 /filmcomp/preset/select i      — 0=LOW, 1=MID, 2=HIGH
@@ -237,11 +244,13 @@ Architecture: zonal v2     Detector: Peak           Bypass: OFF
 
 Atmo:    thr -35   / lift +24 / knee 20
 Dialog:  thr -10.5 / lift +10 / knee 13.5
-Noise:   floor -70.5 / knee 10.5
 Up-Env:  attack 451 ms / release 20 ms    (asymmetric: slow rise / fast fall)
 Duck:    thr -14 / ratio 1.8 / knee 16.5 / attack 9 / release 51   (LOW: off)
 
-Classic stage (used only in arch=Classic):
+Fixed internal guards (not in GUI):
+         noise floor -80 / knee 10.5  ·  SC-HPF 20 Hz  ·  lookahead 20 ms
+
+Legacy classic-stage params (ignored — architecture is fixed v2):
          thr -10 / ratio 4 / max_gain 10 / makeup 0
 ```
 
