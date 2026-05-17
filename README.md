@@ -196,11 +196,25 @@ detected and the unused ones ignored.
 
 ## Presets
 
-A unified dropdown holds the three factory presets (**LOW / MID /
-HIGH**) and any number of your own named presets. Type a name + **Save**
-to store the current settings; pick an entry to load it; **Del** removes
-the active named one. Selection and values persist across restarts in
-the state file.
+cinecomp ships **six built-in stock presets** — two era families, three
+intensities each:
+
+```
+90ies Low    90ies Mid    90ies Hi
+Modern Low   Modern Mid   Modern Hi
+```
+
+The *era* lives in the zone map: 90ies mixes have a louder, hotter
+atmosphere and dialogue with a smaller dynamic spread; modern mixes
+push the zones much further apart. The *intensity* (Low → Mid → Hi)
+raises the atmosphere and dialogue lift and brings in the duck. Pick
+the era that fits the film, then how hard you want it.
+
+One dropdown lists the six stock presets plus any of your own. Type a
+name + **Save** to store the current settings under that name; pick an
+entry to load it; **Del** removes the active named one. Selection and
+values persist across restarts in the state file, and a preset you
+save under a stock name overrides that built-in one.
 
 ## OSC
 
@@ -223,11 +237,12 @@ this engine). Main controls:
 # Fixed internal guards — accepted for compat, not user-facing
 /cinecomp/noise/floor f        /cinecomp/noise/knee f
 
-# Presets
+# Presets — the six stock presets are NAMED presets
+/cinecomp/named/apply s        — load a stock or user preset by name
+/cinecomp/named/save s         /cinecomp/named/delete s
+# Legacy internal slots (not shown in the GUI, kept for compat)
 /cinecomp/preset/select i      — 0=LOW, 1=MID, 2=HIGH
-/cinecomp/preset/save i        — save current params to slot N
-/cinecomp/preset/reset i       — reset slot N to factory defaults
-/cinecomp/named/save s         /cinecomp/named/apply s   /cinecomp/named/delete s
+/cinecomp/preset/save i        /cinecomp/preset/reset i
 
 # Meter subscribe
 /cinecomp/subscribe            — enable UDP meter broadcast
@@ -256,8 +271,9 @@ Legacy classic-stage params (ignored — architecture is fixed v2):
          thr -10 / ratio 4 / max_gain 10 / makeup 0
 ```
 
-On first start (no state file) the MID values are applied; later changes
-are persisted to the state file.
+On first start (no state file) these built-in defaults are active and
+the six stock presets are seeded into the dropdown; pick one (e.g.
+`Modern Mid`) or just tweak — later changes persist to the state file.
 
 ## License
 
