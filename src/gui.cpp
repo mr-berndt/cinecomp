@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -33,6 +34,7 @@
 
 #include <signal.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #include <pwd.h>
 
@@ -147,6 +149,23 @@ static void state_save(const std::string &path) {
     }
 }
 
+// Do the live params still match the named preset that is selected? A preset
+// is a starting point, not a cage: now that the selection survives a restart
+// without being re-applied, the label would otherwise claim a state that the
+// knobs no longer have.
+static bool live_matches_named(const char *name) {
+    engine_preset_t p;
+    if (engine_named_get(name, &p) != 0) return true;
+    for (int i = 0; i < N_FKEYS; i++) {
+        float a = engine_get_param_f(FKEYS[i].id);
+        float b = p.f[FKEYS[i].id];
+        if (std::fabs(a - b) > 1e-4f * (1.0f + std::fabs(b))) return false;
+    }
+    return p.detector_mode     == engine_get_param_i(PARAM_DETECTOR_MODE)
+        && p.downward_en       == engine_get_param_i(PARAM_DOWNWARD_EN)
+        && p.architecture_mode == engine_get_param_i(PARAM_ARCHITECTURE_MODE);
+}
+
 static void state_load(const std::string &path) {
     std::ifstream f(path);
     if (!f) return;
@@ -246,17 +265,23 @@ static void state_load(const std::string &path) {
     for (int i = 0; i < PRESET__COUNT; i++) {
         if (pbuf_seen[i]) engine_preset_set((engine_preset_slot_t)i, &pbuf[i]);
     }
-    // We deliberately do NOT call engine_preset_apply() with active_preset
-    // here. The [live] section already restored the user's live params; an
-    // apply would overwrite them with the preset slot's snapshot, which is
-    // wrong if the user had unsaved edits.
+    // Neither active_preset nor active_named is APPLIED here — only remembered.
     //
-    // active_named, however, IS restored — mirroring the web UI, which
-    // re-applies the active named preset on load so the user's selection
-    // survives a restart. (The live section was just its snapshot anyway.)
+    // The [live] section has just restored what the user actually had. Applying
+    // a preset on top of that throws it away, and that is precisely what used
+    // to happen: every knob turned after picking a preset went into [live] on
+    // save and was overwritten again on the next start, so the program always
+    // came up with the same settings no matter what had been dialled in.
+    //
+    // The old reasoning was "the live section was just its snapshot anyway",
+    // which stops being true the moment anyone touches a control. Picking a
+    // preset is something the user does; starting the program is not.
     if (!active_named.empty()) {
-        if (engine_named_apply(active_named.c_str()) != 0)
-            engine_named_set_active("");
+        engine_preset_t tmp;
+        if (engine_named_get(active_named.c_str(), &tmp) == 0)
+            engine_named_set_active(active_named.c_str());
+        else
+            engine_named_set_active("");    // preset is gone, selection with it
     }
 }
 
@@ -665,6 +690,16 @@ static void draw_peak_pair(ImVec2 origin, float strip_w, float h,
                 col32(weight > 0.05f ? clr::text : clr::text_dim), label);
 }
 
+// Processor time this process has used since the last call - drawing and audio
+// thread together, which is what shows up in htop.
+static double cpu_seconds_delta() {
+    static double last = 0.0;
+    double t = (double)std::clock() / CLOCKS_PER_SEC;
+    double d = t - last;
+    last = t;
+    return d;
+}
+
 // -----------------------------------------------------------------------------
 // Knob descriptor + helper.
 
@@ -745,12 +780,23 @@ int main(int argc, char **argv) {
     GLFWwindow *win = glfwCreateWindow(1280, 760, "filmcomp", nullptr, nullptr);
     if (!win) { glfwTerminate(); engine_stop(); return 1; }
     glfwMakeContextCurrent(win);
-    glfwSwapInterval(1);
+    /* No vsync: the loop below paces itself. Leaving the swap to block for a
+     * whole frame on top of that only adds latency, and on some drivers it
+     * does not block at all, it spins. */
+    glfwSwapInterval(0);
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO &io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    /* The surface gets out of everyone's way. The audio callback runs
+     * SCHED_FIFO and is untouched by this, but the drawing shares this machine
+     * with Brutefir, an X server and a VNC server that are all SCHED_OTHER at
+     * nice 0 - and on four cores at the edge, a window being redrawn is
+     * exactly what takes the last slice away from them. */
+    if (setpriority(PRIO_PROCESS, 0, 12) != 0)
+        std::fprintf(stderr, "filmcomp: nice liess sich nicht setzen\n");
+
     apply_theme();
     ImGui_ImplGlfw_InitForOpenGL(win, true);
     ImGui_ImplOpenGL3_Init("#version 130");
@@ -767,8 +813,44 @@ int main(int argc, char **argv) {
     static float hold_age_in[ENGINE_N_CHANNELS]  = {0};
     static float hold_age_out[ENGINE_N_CHANNELS] = {0};
 
+    /* How often the window is allowed to redraw.
+     *
+     * A single glfwWaitEventsTimeout() is NOT a rate limit: it returns on the
+     * first event, and under a window manager that talks to its clients every
+     * frame that means no limit at all - the loop then runs at whatever the
+     * display will take, which was 50 pictures a second here. So the slot is
+     * sat out in a loop until it is really over. */
+    const double IDLE_DT = 1.0 / 10.0;
+    const double BUSY_DT = 1.0 / 20.0;      /* while a control is being held */
+
+    double t_next = 0.0, t_frame = 0.0, fps = 0.0, cpu_pct = 0.0;
+    int    frames = 0;
+    bool   busy = false;
+
     while (!glfwWindowShouldClose(win) && !g_quit) {
+        for (;;) {
+            double left = t_next - glfwGetTime();
+            if (left <= 0.0) break;
+            glfwWaitEventsTimeout(left);
+        }
         glfwPollEvents();
+
+        /* Minimised: nobody is looking, so nothing gets drawn. */
+        if (glfwGetWindowAttrib(win, GLFW_ICONIFIED)) {
+            t_next = glfwGetTime() + 0.25;
+            continue;
+        }
+
+        double t_now = glfwGetTime();
+        t_next = t_now + (busy ? BUSY_DT : IDLE_DT);
+        frames++;
+        if (t_now - t_frame >= 1.0) {
+            fps     = frames / (t_now - t_frame);
+            cpu_pct = 100.0 * cpu_seconds_delta() / (t_now - t_frame);
+            frames  = 0;
+            t_frame = t_now;
+        }
+
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
@@ -847,6 +929,11 @@ int main(int argc, char **argv) {
         // ===== Header =================================================
         {
             ImGui::TextColored(clr::amber, "filmcomp");
+            /* What the whole client costs, drawing and DSP together, so this
+             * is never a matter of opinion. */
+            ImGui::SameLine(0.0f, 14.0f);
+            ImGui::TextColored(cpu_pct > 25.0 ? clr::duck_red : clr::text_dim,
+                               "%.0f Bilder/s  %.0f %% CPU", fps, cpu_pct);
             ImGui::SameLine();
             ImGui::TextDisabled("· upward compressor (zonal v2)");
             ImGui::SameLine();
@@ -869,7 +956,8 @@ int main(int argc, char **argv) {
             // Current combo label reflects engine state.
             char preview[ENGINE_NAME_LEN + 16];
             if (has_named_active)
-                std::snprintf(preview, sizeof(preview), "%s", named_active.c_str());
+                std::snprintf(preview, sizeof(preview), "%s%s", named_active.c_str(),
+                              live_matches_named(named_active.c_str()) ? "" : " *");
             else if (active >= 0 && active < PRESET__COUNT)
                 std::snprintf(preview, sizeof(preview), "%s", fnames[active]);
             else
@@ -1284,6 +1372,10 @@ int main(int argc, char **argv) {
                 last_save = now;
             }
         }
+
+        /* Only while a control is actually being held does the surface need to
+         * move quickly; the rest of the time nobody is looking that hard. */
+        busy = ImGui::IsAnyItemActive() || ImGui::GetIO().MouseDown[0];
 
         ImGui::Render();
         glViewport(0, 0, w, h);
