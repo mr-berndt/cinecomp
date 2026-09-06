@@ -63,6 +63,18 @@ typedef enum {
     PARAM_DOWNWARD_EN,                          /* int 0/1 */
     PARAM_BYPASS,                               /* int 0/1 */
     PARAM_ARCHITECTURE_MODE,                    /* int 0=classic, 1=v1, 2=v2 */
+
+    /* Makeup follows the dialogue lift, negated. The upward stage makes the
+     * quiet parts louder, and the dialogue zone is what carries the level of
+     * the film - so lifting dialogue by X asks for X of global gain back, or
+     * the whole thing simply gets louder. The stock presets already pair the
+     * two by hand (lift 4/8/10 against makeup -4/-8/-10); this makes that
+     * pairing automatic instead of a thing to remember.
+     *
+     * Live-only, like PARAM_BYPASS: it is a way of operating the compressor,
+     * not part of the sound a preset describes - and the presets carry the
+     * matching makeup value anyway. */
+    PARAM_MAKEUP_FOLLOW_DIALOG,                 /* int 0/1 */
     PARAM__TOTAL_COUNT
 } engine_param_t;
 
@@ -78,6 +90,15 @@ typedef struct {
 /* Engine lifecycle. jack_name is the JACK client name (e.g. "cinecomp"),
  * osc_port the UDP port for the OSC server. Both can be 0/NULL to use
  * defaults ("cinecomp", 14041). Returns 0 on success. */
+/* Run the DSP on host-provided buffers. This is what the JACK callback calls;
+ * a LADSPA host calls it directly, with no JACK involved. Both in and out hold
+ * ENGINE_N_CHANNELS pointers. */
+void engine_process_block(const float *const *in_bufs, float *const *out_bufs,
+                          unsigned nframes);
+
+/* Tell the engine the host's sample rate (forces a filter recompute). */
+void engine_set_sample_rate(unsigned sr);
+
 int  engine_start(const char *jack_name, int osc_port);
 void engine_stop(void);
 unsigned engine_sample_rate(void);

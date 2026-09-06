@@ -61,3 +61,20 @@ run: $(TARGET)
 	./$(TARGET)
 
 .PHONY: all clean run
+
+# ---------------------------------------------------------------- LADSPA --
+# The plugin builds the same engine without JACK, so mpv (or any LADSPA host)
+# can run the compressor with no server and no patchbay:
+#   af=ladspa=file=.../cinecomp_ladspa.so:plugin=cinecomp_stereo
+LADSPA_SO := cinecomp_ladspa.so
+LADSPA_SRC := src/ladspa_cinecomp.c src/audio_engine.c
+
+$(LADSPA_SO): $(LADSPA_SRC) src/audio_engine.h vendor/ladspa.h
+	$(CC) -O3 -ffast-math -funroll-loops -Wall -Wextra -fPIC -shared \
+	      -DCINECOMP_NO_JACK -o $@ $(LADSPA_SRC) -lm -lpthread
+
+ladspa: $(LADSPA_SO)
+
+install-ladspa: $(LADSPA_SO)
+	install -d $(HOME)/.ladspa
+	install -m 755 $(LADSPA_SO) $(HOME)/.ladspa/

@@ -78,7 +78,9 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifndef CINECOMP_NO_JACK
 #include <jack/jack.h>
+#endif
 
 #include "audio_engine.h"
 
@@ -117,13 +119,17 @@
 /* ----------------------------- Shared state ----------------------------- */
 
 static int osc_port = 14041;
+#ifndef CINECOMP_NO_JACK
 static const char *jack_name = "cinecomp";
+#endif
 static int verbose = 0;
 
+#ifndef CINECOMP_NO_JACK
 static jack_client_t *client;
 static jack_port_t *in_ports[N_CHANNELS];
 static jack_port_t *out_ports[N_CHANNELS];
-static jack_nframes_t sample_rate = 48000;
+#endif
+static unsigned sample_rate = 48000;
 
 /* Parameters — set by GUI/OSC, read by audio thread.
  *
@@ -137,6 +143,7 @@ static _Atomic float p_release_ms     = 800.0f;
 static _Atomic float p_hold_ms        =   0.0f;
 static _Atomic float p_knee_db        =  16.5f;  /* duck soft-knee in zonal */
 static _Atomic float p_makeup_db      =   0.0f;
+static _Atomic int   p_makeup_follow_dialog = 0;
 static _Atomic float p_wet_dry        =   1.0f;
 static _Atomic float p_rms_win_ms     =  50.0f;
 static _Atomic float p_sc_hpf_hz      =  20.0f;
@@ -373,8 +380,11 @@ static inline float downward_gain_db(float sc_db, float threshold_db,
 
 /* ----------------------------- Audio callback --------------------------- */
 
-static int audio_callback(jack_nframes_t nframes, void *arg) {
-	(void)arg;
+/* The DSP proper. Identical to what the JACK callback always ran; it only
+ * takes its buffers as arguments now, so a non-JACK host (the LADSPA plugin)
+ * can drive the very same code. */
+void engine_process_block(const float *const *in_bufs, float *const *out_bufs,
+                          unsigned nframes) {
 	static int rt_init_done = 0;
 	if (!rt_init_done) {
 		FC_RT_INIT_FPU();
@@ -401,7 +411,8 @@ static int audio_callback(jack_nframes_t nframes, void *arg) {
 	const float release_ms    = atomic_load_explicit(&p_release_ms,   memory_order_relaxed);
 	const float hold_ms       = atomic_load_explicit(&p_hold_ms,      memory_order_relaxed);
 	const float knee_db       = atomic_load_explicit(&p_knee_db,      memory_order_relaxed);
-	const float makeup_db     = atomic_load_explicit(&p_makeup_db,    memory_order_relaxed);
+	const float makeup_set    = atomic_load_explicit(&p_makeup_db,    memory_order_relaxed);
+	const int   makeup_follow = atomic_load_explicit(&p_makeup_follow_dialog, memory_order_relaxed);
 	const float wet_dry       = fclampf(atomic_load_explicit(&p_wet_dry, memory_order_relaxed), 0.0f, 1.0f);
 	const float rms_win_ms    = atomic_load_explicit(&p_rms_win_ms,   memory_order_relaxed);
 	const float sc_hpf_hz     = atomic_load_explicit(&p_sc_hpf_hz,    memory_order_relaxed);
@@ -420,6 +431,11 @@ static int audio_callback(jack_nframes_t nframes, void *arg) {
 	const float dialog_thr    = atomic_load_explicit(&p_dialog_threshold,  memory_order_relaxed);
 	const float dialog_max    = atomic_load_explicit(&p_dialog_max_gain,   memory_order_relaxed);
 	const float dialog_knee   = atomic_load_explicit(&p_dialog_knee,       memory_order_relaxed);
+
+	/* Coupled: give back exactly what the dialogue zone was allowed to add.
+	 * Has to sit after dialog_max is read, hence down here rather than with
+	 * the other gains. */
+	const float makeup_db     = makeup_follow ? -dialog_max : makeup_set;
 	const float noise_floor   = atomic_load_explicit(&p_noise_floor_db,    memory_order_relaxed);
 	const float noise_knee    = atomic_load_explicit(&p_noise_knee_db,     memory_order_relaxed);
 	const float up_attack_ms  = atomic_load_explicit(&p_upward_attack_ms,  memory_order_relaxed);
@@ -459,8 +475,8 @@ static int audio_callback(jack_nframes_t nframes, void *arg) {
 
 	float *in[N_CHANNELS], *out[N_CHANNELS];
 	for (int ch = 0; ch < N_CHANNELS; ch++) {
-		in[ch]  = jack_port_get_buffer(in_ports[ch], nframes);
-		out[ch] = jack_port_get_buffer(out_ports[ch], nframes);
+		in[ch]  = (float *)in_bufs[ch];
+		out[ch] = out_bufs[ch];
 	}
 
 	/* Per-block peak accumulators (local, then published atomic at block end). */
@@ -473,7 +489,7 @@ static int audio_callback(jack_nframes_t nframes, void *arg) {
 	/* Whether we need the duck-specific peak follower (zonal+dual only). */
 	const int need_duck_peak = ((arch_mode == 1 || arch_mode == 2) && detector_mode == 2);
 
-	for (jack_nframes_t i = 0; i < nframes; i++) {
+	for (unsigned i = 0; i < nframes; i++) {
 		/* ---- Per-channel detection ----
 		 *
 		 * Compute RMS and Peak follower outputs for every channel,
@@ -695,17 +711,36 @@ static int audio_callback(jack_nframes_t nframes, void *arg) {
 	}
 	atomic_store_explicit(&current_sc_db,           sc_block_last,   memory_order_relaxed);
 	atomic_store_explicit(&current_gain_atomic_db,  gain_block_last, memory_order_relaxed);
-
-	return 0;
 }
 
-static int sample_rate_callback(jack_nframes_t nframes, void *arg) {
+#ifndef CINECOMP_NO_JACK
+/* JACK entry point: fetch the port buffers, then run the shared DSP. */
+static int audio_callback(jack_nframes_t nframes, void *arg) {
 	(void)arg;
-	sample_rate = nframes;
+	const float *in[N_CHANNELS];
+	float *out[N_CHANNELS];
+	for (int ch = 0; ch < N_CHANNELS; ch++) {
+		in[ch]  = jack_port_get_buffer(in_ports[ch], nframes);
+		out[ch] = jack_port_get_buffer(out_ports[ch], nframes);
+	}
+	engine_process_block(in, out, nframes);
+	return 0;
+}
+#endif
+
+void engine_set_sample_rate(unsigned sr) {
+	if (sr) sample_rate = sr;
 	/* Force HPF recompute next audio block. */
 	current_hpf_hz = 0.0f;
+}
+
+#ifndef CINECOMP_NO_JACK
+static int sample_rate_callback(jack_nframes_t nframes, void *arg) {
+	(void)arg;
+	engine_set_sample_rate(nframes);
 	return 0;
 }
+#endif
 
 /* ----------------------------- OSC ------------------------------------- */
 
@@ -817,6 +852,8 @@ static void send_state(struct sockaddr_in *dst) {
 	send_one_float(dst, "/cinecomp/hold_ms",    atomic_load_explicit(&p_hold_ms,      memory_order_relaxed));
 	send_one_float(dst, "/cinecomp/knee_db",    atomic_load_explicit(&p_knee_db,      memory_order_relaxed));
 	send_one_float(dst, "/cinecomp/makeup_db",  atomic_load_explicit(&p_makeup_db,    memory_order_relaxed));
+	send_one_int  (dst, "/cinecomp/makeup_follow_dialog",
+	               atomic_load_explicit(&p_makeup_follow_dialog, memory_order_relaxed));
 	send_one_float(dst, "/cinecomp/wet_dry",    atomic_load_explicit(&p_wet_dry,      memory_order_relaxed));
 	send_one_float(dst, "/cinecomp/rms_win_ms", atomic_load_explicit(&p_rms_win_ms,   memory_order_relaxed));
 	send_one_float(dst, "/cinecomp/sc_hpf_hz",  atomic_load_explicit(&p_sc_hpf_hz,    memory_order_relaxed));
@@ -894,7 +931,8 @@ static void handle_osc(const uint8_t *buf, int len, struct sockaddr_in *src) {
 	else if (strcmp(path, "/cinecomp/release_ms") == 0) atomic_store(&p_release_ms, fclampf(READ_F(400.0f), 10.0f, 2000.0f));
 	else if (strcmp(path, "/cinecomp/hold_ms") == 0) atomic_store(&p_hold_ms, fclampf(READ_F(25.0f), 0.0f, 200.0f));
 	else if (strcmp(path, "/cinecomp/knee_db") == 0) atomic_store(&p_knee_db, fclampf(READ_F(6.0f), 0.0f, 30.0f));
-	else if (strcmp(path, "/cinecomp/makeup_db") == 0) atomic_store(&p_makeup_db, fclampf(READ_F(0.0f), -12.0f, 18.0f));
+	else if (strcmp(path, "/cinecomp/makeup_db") == 0) atomic_store(&p_makeup_db, fclampf(READ_F(0.0f), -30.0f, 20.0f));
+	else if (strcmp(path, "/cinecomp/makeup_follow_dialog") == 0) atomic_store(&p_makeup_follow_dialog, READ_I(0) ? 1 : 0);
 	else if (strcmp(path, "/cinecomp/wet_dry") == 0) atomic_store(&p_wet_dry, fclampf(READ_F(1.0f), 0.0f, 1.0f));
 	else if (strcmp(path, "/cinecomp/rms_win_ms") == 0) atomic_store(&p_rms_win_ms, fclampf(READ_F(300.0f), 10.0f, 2000.0f));
 	else if (strcmp(path, "/cinecomp/sc_hpf_hz") == 0) atomic_store(&p_sc_hpf_hz, fclampf(READ_F(60.0f), 20.0f, 500.0f));
@@ -991,6 +1029,7 @@ static const char *channel_names[N_CHANNELS] = {
 	"L", "R", "C", "LFE", "LS", "RS", "RBL", "RBR"
 };
 
+#ifndef CINECOMP_NO_JACK
 static int jack_register_ports(void) {
 	for (int ch = 0; ch < N_CHANNELS; ch++) {
 		char name[32];
@@ -1124,6 +1163,7 @@ void engine_stop(void) {
 
 	engine_running = 0;
 }
+#endif /* CINECOMP_NO_JACK */
 
 unsigned engine_sample_rate(void) {
 	return sample_rate;
@@ -1171,7 +1211,10 @@ void engine_set_param_f(engine_param_t id, float v) {
 	case PARAM_RELEASE_MS:       atomic_store(&p_release_ms,   fclampf(v, 10.0f, 2000.0f)); break;
 	case PARAM_HOLD_MS:          atomic_store(&p_hold_ms,      fclampf(v, 0.0f, 200.0f)); break;
 	case PARAM_KNEE_DB:          atomic_store(&p_knee_db,      fclampf(v, 0.0f, 30.0f)); break;
-	case PARAM_MAKEUP_DB:        atomic_store(&p_makeup_db,    fclampf(v, -12.0f, 18.0f)); break;
+	/* Nach unten so weit, wie der Dialog-Lift nach oben kann (30 dB) - sonst
+	 * laesst sich sein Maximum von Hand nicht mehr ausgleichen, und die
+	 * Kopplung koennte an einer Klemme haengen bleiben, die sie nicht sieht. */
+	case PARAM_MAKEUP_DB:        atomic_store(&p_makeup_db,    fclampf(v, -30.0f, 20.0f)); break;
 	case PARAM_WET_DRY:          atomic_store(&p_wet_dry,      fclampf(v, 0.0f, 1.0f)); break;
 	case PARAM_RMS_WIN_MS:       atomic_store(&p_rms_win_ms,   fclampf(v, 10.0f, 2000.0f)); break;
 	case PARAM_SC_HPF_HZ:        atomic_store(&p_sc_hpf_hz,    fclampf(v, 20.0f, 500.0f)); break;
@@ -1197,6 +1240,7 @@ void engine_set_param_f(engine_param_t id, float v) {
 
 int engine_get_param_i(engine_param_t id) {
 	switch (id) {
+	case PARAM_MAKEUP_FOLLOW_DIALOG: return atomic_load(&p_makeup_follow_dialog);
 	case PARAM_DETECTOR_MODE:     return atomic_load(&p_detector_mode);
 	case PARAM_DOWNWARD_EN:       return atomic_load(&p_downward_en);
 	case PARAM_BYPASS:            return atomic_load(&p_bypass);
@@ -1215,6 +1259,8 @@ void engine_set_param_i(engine_param_t id, int v) {
 	}
 	case PARAM_DOWNWARD_EN:       atomic_store(&p_downward_en, v ? 1 : 0); break;
 	case PARAM_BYPASS:            atomic_store(&p_bypass,      v ? 1 : 0); break;
+	case PARAM_MAKEUP_FOLLOW_DIALOG:
+		atomic_store(&p_makeup_follow_dialog, v ? 1 : 0); break;
 	case PARAM_ARCHITECTURE_MODE: {
 		int x = v;
 		if (x < 0) x = 0; else if (x > 2) x = 2;

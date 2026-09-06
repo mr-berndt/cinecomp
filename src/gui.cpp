@@ -115,6 +115,7 @@ static void state_save(const std::string &path) {
     f << "detector_mode     = " << engine_get_param_i(PARAM_DETECTOR_MODE)     << "\n";
     f << "downward_en       = " << engine_get_param_i(PARAM_DOWNWARD_EN)       << "\n";
     f << "bypass            = " << engine_get_param_i(PARAM_BYPASS)            << "\n";
+    f << "makeup_follow_dialog = " << engine_get_param_i(PARAM_MAKEUP_FOLLOW_DIALOG) << "\n";
     f << "architecture_mode = " << engine_get_param_i(PARAM_ARCHITECTURE_MODE) << "\n";
     f << "active_preset     = " << engine_preset_active() << "\n";
     f << "active_named      = " << engine_named_active()   << "\n";
@@ -246,6 +247,7 @@ static void state_load(const std::string &path) {
             if      (key == "detector_mode")     engine_set_param_i(PARAM_DETECTOR_MODE,     std::atoi(val.c_str()));
             else if (key == "downward_en")       engine_set_param_i(PARAM_DOWNWARD_EN,       std::atoi(val.c_str()));
             else if (key == "bypass")            engine_set_param_i(PARAM_BYPASS,            std::atoi(val.c_str()));
+            else if (key == "makeup_follow_dialog") engine_set_param_i(PARAM_MAKEUP_FOLLOW_DIALOG, std::atoi(val.c_str()));
             else if (key == "architecture_mode") engine_set_param_i(PARAM_ARCHITECTURE_MODE, std::atoi(val.c_str()));
             else if (key == "active_named")      active_named = val;
             // active_preset is informational only — see comment below.
@@ -1252,12 +1254,41 @@ int main(int argc, char **argv) {
             ImGui::Columns(3, "##globalrow", false);
             // Makeup + side-chain decay + wet/dry. SC-HPF, lookahead and
             // the noise-floor guard are fixed internals — not exposed.
+            /* -30 statt -12 nach unten: der Upward-Teil hebt bis 30 dB an,
+               und der Makeup muss das global wieder abziehen koennen. Bei -12
+               sass der Regler am Anschlag, waehrend Dialog Lift auf 18,1 und
+               Atmo Lift auf 24,3 dB standen - auf Pegel zurueckholen liess
+               sich das gar nicht. */
             static const KnobDesc GLB_KNOBS[] = {
-                {"Makeup",   PARAM_MAKEUP_DB,   -12.0f, 18.0f,   "%.1f dB"},
+                {"Makeup",   PARAM_MAKEUP_DB,   -30.0f, 20.0f,   "%.1f dB"},
                 {"SC Decay", PARAM_RMS_WIN_MS,   10.0f, 2000.0f, "%.0f ms"},
                 {"Wet/Dry",  PARAM_WET_DRY,       0.0f, 1.0f,    "%.2f"},
             };
-            for (int i = 0; i < 3; i++) {
+
+            bool follow = engine_get_param_i(PARAM_MAKEUP_FOLLOW_DIALOG) != 0;
+
+            /* Gekoppelt wird der abgeleitete Wert in den Parameter selbst
+               geschrieben, nicht nur im Signalweg verrechnet. Damit zeigt der
+               Regler die Wahrheit, die Datei enthaelt die Wahrheit, und beim
+               Loesen der Kopplung springt nichts - er steht dann genau da,
+               wo die Kopplung ihn zuletzt hatte. Zwei Zahlen fuer dieselbe
+               Sache waeren schlimmer als eine unbewegliche. */
+            if (follow) {
+                float want = -engine_get_param_f(PARAM_DIALOG_MAX_GAIN);
+                if (std::fabs(engine_get_param_f(PARAM_MAKEUP_DB) - want) > 0.001f) {
+                    engine_set_param_f(PARAM_MAKEUP_DB, want);
+                    mark_dirty();
+                }
+            }
+            ImGui::BeginDisabled(follow);
+            if (labeled_slider(GLB_KNOBS[0], 220)) mark_dirty();
+            ImGui::EndDisabled();
+            if (ImGui::Checkbox("folgt Dialog Lift", &follow)) {
+                engine_set_param_i(PARAM_MAKEUP_FOLLOW_DIALOG, follow ? 1 : 0);
+                mark_dirty();
+            }
+            ImGui::NextColumn();
+            for (int i = 1; i < 3; i++) {
                 if (labeled_slider(GLB_KNOBS[i], 220 + i)) mark_dirty();
                 ImGui::NextColumn();
             }
