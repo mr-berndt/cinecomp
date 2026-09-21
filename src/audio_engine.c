@@ -157,6 +157,9 @@ static _Atomic int   p_detector_mode  =   1;
  * p_detector_mode ist nur noch der Sammelschalter davor. */
 static _Atomic int   p_det_up          =   1;   /* 0=RMS, 1=Peak */
 static _Atomic int   p_det_down        =   1;
+/* Anteil der Daempfung auf dem Center, in Prozent - siehe Kopfdatei.
+ * 100 = wie bisher, alle acht Kanaele teilen sich eine Verstaerkung. */
+static _Atomic int   p_duck_center_pct = 100;
 static _Atomic int   p_downward_en    =   1;
 static _Atomic float p_down_threshold = -14.0f;
 static _Atomic float p_down_ratio     =   1.8f;
@@ -444,6 +447,7 @@ void engine_process_block(const float *const *in_bufs, float *const *out_bufs,
 	const float sc_hpf_hz     = atomic_load_explicit(&p_sc_hpf_hz,    memory_order_relaxed);
 	const float lookahead_ms  = atomic_load_explicit(&p_lookahead_ms, memory_order_relaxed);
 	const float max_gain_db   = atomic_load_explicit(&p_max_gain_db,  memory_order_relaxed);
+	const int   duck_center_pct = atomic_load_explicit(&p_duck_center_pct, memory_order_relaxed);
 	const int   det_up        = atomic_load_explicit(&p_det_up,   memory_order_relaxed);
 	const int   det_down      = atomic_load_explicit(&p_det_down, memory_order_relaxed);
 	const int   downward_en   = atomic_load_explicit(&p_downward_en,  memory_order_relaxed);
@@ -701,6 +705,15 @@ void engine_process_block(const float *const *in_bufs, float *const *out_bufs,
 		gain_block_last = gain_current_db;
 
 		float gain_lin = db_to_lin(gain_current_db + makeup_db);
+		/* Der Center bekommt die Anhebung voll und die Daempfung nur
+		 * anteilig - siehe PARAM_DUCK_CENTER_PCT. Nur in der zonalen
+		 * Architektur, denn nur dort wird der Duck-Anteil getrennt
+		 * gefuehrt. */
+		float gain_lin_c = gain_lin;
+		if (duck_center_pct < 100 && (arch_mode == 1 || arch_mode == 2))
+			gain_lin_c = db_to_lin(gain_upward_current_db
+			                       + gain_duck_current_db * (duck_center_pct * 0.01f)
+			                       + makeup_db);
 
 		/* ---- Apply with look-ahead delay ----
 		 * Ring buffer: write current sample, read sample from
@@ -718,7 +731,7 @@ void engine_process_block(const float *const *in_bufs, float *const *out_bufs,
 				/* Pass through with delay — preserve lipsync. */
 				y = in_delayed;
 			} else {
-				float wet = in_delayed * gain_lin;
+				float wet = in_delayed * ((ch == 2) ? gain_lin_c : gain_lin);
 				y = wet_dry * wet + (1.0f - wet_dry) * in_delayed;
 			}
 			out[ch][i] = y;
@@ -906,6 +919,7 @@ static void send_state(struct sockaddr_in *dst) {
 	send_one_float(dst, "/cinecomp/lookahead_ms", atomic_load_explicit(&p_lookahead_ms, memory_order_relaxed));
 	send_one_float(dst, "/cinecomp/max_gain",   atomic_load_explicit(&p_max_gain_db,  memory_order_relaxed));
 	send_one_int  (dst, "/cinecomp/detector",   engine_get_param_i(PARAM_DETECTOR_MODE));
+	send_one_int  (dst, "/cinecomp/duck/center_pct", atomic_load_explicit(&p_duck_center_pct, memory_order_relaxed));
 	send_one_int  (dst, "/cinecomp/det_up",     atomic_load_explicit(&p_det_up,   memory_order_relaxed));
 	send_one_int  (dst, "/cinecomp/det_down",   atomic_load_explicit(&p_det_down, memory_order_relaxed));
 	send_one_int  (dst, "/cinecomp/downward/enable",   atomic_load_explicit(&p_downward_en,    memory_order_relaxed));
@@ -1021,6 +1035,11 @@ static void handle_osc(const uint8_t *buf, int len, struct sockaddr_in *src) {
 		 * Setzt beide Richtungen, siehe engine_set_param_i. */
 		if (v < 0) v = 0; else if (v > 2) v = 2;
 		engine_set_param_i(PARAM_DETECTOR_MODE, v);
+	}
+	else if (strcmp(path, "/cinecomp/duck/center_pct") == 0) {
+		int v = READ_I(100);
+		if (v < 0) v = 0; else if (v > 100) v = 100;
+		atomic_store(&p_duck_center_pct, v);
 	}
 	else if (strcmp(path, "/cinecomp/det_up") == 0)
 		atomic_store(&p_det_up, READ_I(1) ? 1 : 0);
@@ -1334,6 +1353,7 @@ int engine_get_param_i(engine_param_t id) {
 		if (u == 0 && d == 1) return 2;
 		return 1;
 	}
+	case PARAM_DUCK_CENTER_PCT:   return atomic_load(&p_duck_center_pct);
 	case PARAM_DET_UP:            return atomic_load(&p_det_up);
 	case PARAM_DET_DOWN:          return atomic_load(&p_det_down);
 	case PARAM_DOWNWARD_EN:       return atomic_load(&p_downward_en);
@@ -1354,6 +1374,10 @@ void engine_set_param_i(engine_param_t id, int v) {
 		atomic_store(&p_det_up,   (x == 1) ? 1 : 0);
 		atomic_store(&p_det_down, (x == 0) ? 0 : 1);
 		break;
+	}
+	case PARAM_DUCK_CENTER_PCT: {
+		int x = v; if (x < 0) x = 0; else if (x > 100) x = 100;
+		atomic_store(&p_duck_center_pct, x); break;
 	}
 	case PARAM_DET_UP:   atomic_store(&p_det_up,   v ? 1 : 0); break;
 	case PARAM_DET_DOWN: atomic_store(&p_det_down, v ? 1 : 0); break;

@@ -101,6 +101,29 @@ typedef enum {
      * gespeicherte Einstellungen auf die falschen Werte. */
     PARAM_DET_UP,           /* int 0=RMS, 1=Peak - Aufwaertsstufe */
     PARAM_DET_DOWN,         /* int 0=RMS, 1=Peak - Ducker         */
+    /* Wieviel der DAEMPFUNG auf dem Center landet, in Prozent.
+     *
+     * Der Grund, gefunden am 21.9.2026: eine einzige Verstaerkung wird auf
+     * alle acht Kanaele angewandt. Ein Einschlag im LFE oder in den
+     * Surrounds drueckt die Seitenkette ueber die Schwelle - und der Center
+     * geht mit. Der Dialog wird also nicht von seiner eigenen Lautstaerke
+     * gedaempft, sondern von der Explosion nebenan.
+     *
+     * Deshalb ist es auch kein Zeitproblem: schnelles Loslassen pumpt,
+     * langsames laesst den Dialog nach jedem Einschlag liegen. Beides ist
+     * richtig, weil beide Male der falsche Kanal gedaempft wird.
+     *
+     * Nur die DAEMPFUNG ist betroffen, die Anhebung bekommt der Center voll
+     * - sonst naehme man ihm den Lift, um den es ja gerade geht. 100 = wie
+     * bisher.
+     *
+     * ACHTUNG, Unterschied zu filmcomp auf convolver: dort steht dieser
+     * Parameter VOR DET_UP/DET_DOWN, hier dahinter. Der Grund ist, dass hier
+     * 31 und 32 schon vergeben sind - cinecomp-control.lua und
+     * ~/.config/mpv/mpv-cinecomp-params sprechen sie ueber die Nummer an.
+     * Die Nummern der beiden Baeume sind also NICHT austauschbar; OSC ist es
+     * (dort zaehlt der Pfad). */
+    PARAM_DUCK_CENTER_PCT,  /* int 0..100 */
     PARAM__TOTAL_COUNT
 } engine_param_t;
 

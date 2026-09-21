@@ -115,6 +115,7 @@ static void state_save(const std::string &path) {
     f << "detector_mode     = " << engine_get_param_i(PARAM_DETECTOR_MODE)     << "\n";
     f << "det_up            = " << engine_get_param_i(PARAM_DET_UP)            << "\n";
     f << "det_down          = " << engine_get_param_i(PARAM_DET_DOWN)          << "\n";
+    f << "duck_center_pct   = " << engine_get_param_i(PARAM_DUCK_CENTER_PCT)   << "\n";
     f << "downward_en       = " << engine_get_param_i(PARAM_DOWNWARD_EN)       << "\n";
     f << "bypass            = " << engine_get_param_i(PARAM_BYPASS)            << "\n";
     f << "makeup_follow_dialog = " << engine_get_param_i(PARAM_MAKEUP_FOLLOW_DIALOG) << "\n";
@@ -249,6 +250,7 @@ static void state_load(const std::string &path) {
             if      (key == "detector_mode")     engine_set_param_i(PARAM_DETECTOR_MODE,     std::atoi(val.c_str()));
             else if (key == "det_up")            engine_set_param_i(PARAM_DET_UP,            std::atoi(val.c_str()));
             else if (key == "det_down")          engine_set_param_i(PARAM_DET_DOWN,          std::atoi(val.c_str()));
+            else if (key == "duck_center_pct")   engine_set_param_i(PARAM_DUCK_CENTER_PCT,   std::atoi(val.c_str()));
             else if (key == "downward_en")       engine_set_param_i(PARAM_DOWNWARD_EN,       std::atoi(val.c_str()));
             else if (key == "bypass")            engine_set_param_i(PARAM_BYPASS,            std::atoi(val.c_str()));
             else if (key == "makeup_follow_dialog") engine_set_param_i(PARAM_MAKEUP_FOLLOW_DIALOG, std::atoi(val.c_str()));
@@ -774,6 +776,23 @@ static bool labeled_slider(const KnobDesc &k, int pushid, float width = -1.0f) {
     return ch;
 }
 
+// Same for integer parameters. There is only one: the centre's share of the
+// duck is a percentage, and a float slider would suggest decimals the engine
+// does not have.
+static bool labeled_slider_i(const char *label, engine_param_t id,
+                             int v_min, int v_max, const char *fmt,
+                             int pushid) {
+    int v = engine_get_param_i(id);
+    ImGui::TextColored(clr::text_sand, "%s", label);
+    ImGui::PushID(pushid);
+    ImGui::SetNextItemWidth(-1);
+    bool ch = ImGui::SliderInt("##si", &v, v_min, v_max, fmt,
+                               ImGuiSliderFlags_AlwaysClamp);
+    ImGui::PopID();
+    if (ch) engine_set_param_i(id, v);
+    return ch;
+}
+
 // Header button — bordered, accent color when active.
 static bool seg_button(const char *label, bool active, ImVec2 size,
                        ImVec4 active_color = clr::amber) {
@@ -985,7 +1004,6 @@ int main(int argc, char **argv) {
         }
 
         const int arch_mode = 2;   // fixed: Classic/v1 retired, v2 only
-        int det_mode  = engine_get_param_i(PARAM_DETECTOR_MODE);
 
         // ===== Header =================================================
         {
@@ -1314,7 +1332,7 @@ int main(int argc, char **argv) {
             ImGui::Spacing();
 
             // Row 2: duck attack / release
-            ImGui::Columns(2, "##dnrow2", false);
+            ImGui::Columns(3, "##dnrow2", false);
             static const KnobDesc DN_ROW2[] = {
                 {"Attack",  PARAM_DUCK_ATTACK_MS,  0.1f, 100.0f,  "%.1f ms"},
                 {"Release", PARAM_DUCK_RELEASE_MS, 1.0f, 2000.0f, "%.0f ms"},
@@ -1323,6 +1341,21 @@ int main(int argc, char **argv) {
                 if (labeled_slider(DN_ROW2[i], 210 + i)) mark_dirty();
                 ImGui::NextColumn();
             }
+            // How much of the duck lands on the centre. It belongs here and
+            // not under GLOBAL because it only concerns the downward stage:
+            // the centre always gets the full lift. 100 = as before, all
+            // eight channels share one gain - so the impact in the LFE ducks
+            // the dialogue along with it.
+            if (labeled_slider_i("Center", PARAM_DUCK_CENTER_PCT,
+                                 0, 100, "%d %%", 212)) mark_dirty();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Share of the duck applied to channel 3 "
+                                  "(centre).\n"
+                                  "100 %% = as before, dialogue is ducked by "
+                                  "explosions.\n"
+                                  "0 %% = dialogue stays put, only the other "
+                                  "seven go down.");
+            ImGui::NextColumn();
             ImGui::Columns(1);
             ImGui::EndDisabled();
 

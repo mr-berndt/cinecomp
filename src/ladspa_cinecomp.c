@@ -58,6 +58,7 @@ static const char *const ctl_name[N_CTL] = {
     /* Reihenfolge wie in engine_param_t - beide ans ENDE, damit die
      * Nummern der bestehenden Anschluesse sich nicht verschieben. */
     "Detector up (0=RMS 1=Peak)", "Detector down (0=RMS 1=Peak)",
+    "Duck on center (%)",
 };
 
 /* Ranges are deliberately generous: the engine clamps what it needs to, and a
@@ -109,6 +110,7 @@ static const struct { float lo, hi; int deflt; int integer; } ctl_range[N_CTL] =
         { 0.0f, 1.0f, DEF_MIN, 1 },  /* makeup follows   */
         { 0.0f, 1.0f, DEF_MAX, 1 },  /* detector up      */
         { 0.0f, 1.0f, DEF_MAX, 1 },  /* detector down    */
+        { 0.0f, 100.0f, DEF_MAX, 1 },  /* duck on center   */
 };
 
 /* Port layout: n audio in, n audio out, then all controls. */

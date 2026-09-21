@@ -78,3 +78,9 @@ ladspa: $(LADSPA_SO)
 install-ladspa: $(LADSPA_SO)
 	install -d $(HOME)/.ladspa
 	install -m 755 $(LADSPA_SO) $(HOME)/.ladspa/
+
+# Header dependency. Without it gui.o stayed behind when audio_engine.h grew
+# by two parameters on 21.9.2026 - the GUI then counted with the old
+# numbering and wrote det_up where duck_center_pct stood. The failure is
+# silent: it compiles, it runs, and only the values wander.
+src/audio_engine.o src/gui.o: src/audio_engine.h
