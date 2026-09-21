@@ -59,26 +59,7 @@ typedef enum {
 
     PARAM__FLOAT_COUNT,
 
-    /* Legacy-Sammelschalter: 0=RMS, 1=Peak, 2=Dual (RMS oben, Peak unten).
-     * Bleibt erhalten, damit alte Presets und alte OSC-Sender weiter
-     * funktionieren - er SETZT jetzt aber nur noch die beiden Schalter
-     * darunter, und beim Lesen wird er aus ihnen abgeleitet. */
     PARAM_DETECTOR_MODE = PARAM__FLOAT_COUNT,   /* int 0=RMS, 1=Peak, 2=Dual */
-
-    /* ----------------------- Peak oder RMS, je Richtung -------------------
-     *
-     * Was die Seitenkette misst, getrennt fuer die beiden Stufen:
-     * PARAM_DET_UP fuer die Aufwaertsstufe, PARAM_DET_DOWN fuer den Ducker.
-     *
-     * Die beiden Stufen stellen verschiedene Fragen. Die Aufwaertsstufe hebt
-     * Leises an und will wissen, wie LAUT es im Mittel ist - dafuer ist RMS
-     * gebaut, ein einzelner Knall soll das Anheben nicht abwuergen. Der
-     * Ducker soll dagegen genau diesen Knall erwischen, bevor er da ist,
-     * und dafuer taugt nur Peak.
-     *
-     * Das war bisher der Sammelschalter "Dual", aber nur in der zonalen
-     * Architektur und nicht frei waehlbar. Jetzt sind es zwei Schalter.
-     */
     PARAM_DOWNWARD_EN,                          /* int 0/1 */
     PARAM_BYPASS,                               /* int 0/1 */
     PARAM_ARCHITECTURE_MODE,                    /* int 0=classic, 1=v1, 2=v2 */
@@ -94,13 +75,6 @@ typedef enum {
      * not part of the sound a preset describes - and the presets carry the
      * matching makeup value anyway. */
     PARAM_MAKEUP_FOLLOW_DIALOG,                 /* int 0/1 */
-    /* ANS ENDE, und das ist kein Schoenheitsfehler: das LADSPA-Plugin und
-     * cinecomp-control.lua sprechen die Parameter ueber ihre NUMMER an, und
-     * ~/.config/mpv/mpv-cinecomp-params enthaelt diese Nummern. Wer hier in
-     * der Mitte einfuegt, verschiebt alles Dahinterliegende und richtet
-     * gespeicherte Einstellungen auf die falschen Werte. */
-    PARAM_DET_UP,           /* int 0=RMS, 1=Peak - Aufwaertsstufe */
-    PARAM_DET_DOWN,         /* int 0=RMS, 1=Peak - Ducker         */
     PARAM__TOTAL_COUNT
 } engine_param_t;
 
@@ -111,7 +85,6 @@ typedef struct {
     float weight[ENGINE_N_CHANNELS];    /* 0..1 channel activity */
     float sc_db;                        /* side-chain RMS in dB */
     float sc_max;                       /* loudest side-chain since the last read */
-    float sc_dn_db;                     /* side-chain the downward stage sees */
     float gain_db;                      /* currently applied upward gain */
 } engine_meters_t;
 
@@ -158,9 +131,7 @@ typedef enum {
  * for floats; ints follow. */
 typedef struct {
     float f[PARAM__FLOAT_COUNT];
-    int   detector_mode;    /* Legacy, siehe oben - beim Laden ausgewertet */
-    int   det_up;           /* 0=RMS, 1=Peak */
-    int   det_down;
+    int   detector_mode;
     int   downward_en;
     int   architecture_mode;
 } engine_preset_t;

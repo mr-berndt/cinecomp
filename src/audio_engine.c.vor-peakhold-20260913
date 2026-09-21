@@ -153,10 +153,6 @@ static _Atomic float p_max_gain_db    =  18.5f;
  * Dual is meaningful only in zonal architecture mode — classic ignores it
  * and falls back to RMS. */
 static _Atomic int   p_detector_mode  =   1;
-/* Die eigentliche Wahrheit seit 21.9.2026: was jede Stufe misst.
- * p_detector_mode ist nur noch der Sammelschalter davor. */
-static _Atomic int   p_det_up          =   1;   /* 0=RMS, 1=Peak */
-static _Atomic int   p_det_down        =   1;
 static _Atomic int   p_downward_en    =   1;
 static _Atomic float p_down_threshold = -14.0f;
 static _Atomic float p_down_ratio     =   1.8f;
@@ -214,36 +210,14 @@ static int   delay_pos = 0;
 static int   delay_initialised = 0;
 
 /* Meters — written by audio thread (atomic), read by peak reporter. */
-/* One set per consumer. The local GUI reads twenty times a second, the
- * network reporter fifty, and both clear what they read: with a single set
- * the GUI only ever saw a fraction of each interval - most of the sound
- * never reached the meter. Each reader now clears its own. */
-#define METER_LOCAL     0
-#define METER_NET       1
-#define METER_CONSUMERS 2
-static _Atomic float peak_in_acc[METER_CONSUMERS][N_CHANNELS];
-static _Atomic float peak_out_acc[METER_CONSUMERS][N_CHANNELS];
-/* Loudest side-chain value since each consumer last looked. A peak hold needs
- * the loudest moment, not the one value that happened to be current. */
-static _Atomic float sc_max_acc[METER_CONSUMERS] = { -120.0f, -120.0f };
+static _Atomic float peak_in_acc[N_CHANNELS];
+static _Atomic float peak_out_acc[N_CHANNELS];
 static _Atomic float weight_acc[N_CHANNELS];
 static _Atomic float current_sc_db    = -INFINITY;
-/* Der Sidechain, den die Abwaertsstufe sieht. Im Dual-Betrieb ist das der
- * Peak und damit ein anderer Wert als current_sc_db - genau der Unterschied,
- * der die Duck-Flanke im Bild an die falsche Stelle malt. */
-static _Atomic float current_sc_dn_db = -INFINITY;
 static _Atomic float current_gain_atomic_db = 0.0f;
 
 static int osc_socket = -1;
 static struct sockaddr_in subscribers[MAX_SUBSCRIBERS];
-/* Wann sich jeder zuletzt gemeldet hat. Ohne das blieb ein Platz fuer immer
- * belegt: wer einmal drinstand, stand bis zum Neustart drin, und nach acht
- * verschiedenen Adressen bekam niemand Neues mehr etwas - die Anzeige sagte
- * dann "no connection", obwohl die Engine munter an tote Adressen sendete.
- * Die Bruecke erneuert ihr /subscribe alle 3 s, also ist eine Frist von 10 s
- * reichlich und kostet kein Protokoll. */
-#define SUBSCRIBER_TTL 10
-static time_t subscriber_seen[MAX_SUBSCRIBERS];
 static int subscriber_count = 0;
 static pthread_mutex_t subscriber_mtx = PTHREAD_MUTEX_INITIALIZER;
 
@@ -444,8 +418,7 @@ void engine_process_block(const float *const *in_bufs, float *const *out_bufs,
 	const float sc_hpf_hz     = atomic_load_explicit(&p_sc_hpf_hz,    memory_order_relaxed);
 	const float lookahead_ms  = atomic_load_explicit(&p_lookahead_ms, memory_order_relaxed);
 	const float max_gain_db   = atomic_load_explicit(&p_max_gain_db,  memory_order_relaxed);
-	const int   det_up        = atomic_load_explicit(&p_det_up,   memory_order_relaxed);
-	const int   det_down      = atomic_load_explicit(&p_det_down, memory_order_relaxed);
+	const int   detector_mode = atomic_load_explicit(&p_detector_mode, memory_order_relaxed);
 	const int   downward_en   = atomic_load_explicit(&p_downward_en,  memory_order_relaxed);
 	const float down_thr      = atomic_load_explicit(&p_down_threshold, memory_order_relaxed);
 	const float down_ratio    = atomic_load_explicit(&p_down_ratio,   memory_order_relaxed);
@@ -511,18 +484,10 @@ void engine_process_block(const float *const *in_bufs, float *const *out_bufs,
 	float peak_out_block[N_CHANNELS] = {0};
 	float weight_block[N_CHANNELS]   = {0};
 	float sc_block_last = -120.0f;
-	float sc_block_max  = -120.0f;
-	float sc_dn_block_last = -120.0f;
 	float gain_block_last = 0.0f;
 
-	/* Der eigene Peak-Folger des Duckers, dessen Abklingen an sein Release
-	 * gekoppelt ist. Er laeuft weiterhin GENAU in der alten Dual-Kombination
-	 * - zonal, oben RMS, unten Peak. Bei Peak/Peak benutzt der Ducker wie
-	 * bisher den gemeinsamen Folger; das ist nicht unbedingt das Richtige,
-	 * aber es ist das, was der alte Modus 1 tat, und eine stille Aenderung
-	 * daran wuerde bestehende Presets anders klingen lassen. */
-	const int need_duck_peak = ((arch_mode == 1 || arch_mode == 2)
-	                            && det_up == 0 && det_down == 1);
+	/* Whether we need the duck-specific peak follower (zonal+dual only). */
+	const int need_duck_peak = ((arch_mode == 1 || arch_mode == 2) && detector_mode == 2);
 
 	for (unsigned i = 0; i < nframes; i++) {
 		/* ---- Per-channel detection ----
@@ -568,7 +533,7 @@ void engine_process_block(const float *const *in_bufs, float *const *out_bufs,
 			/* Activity weight: classic uses the active detector for
 			 * backward compatibility, zonal always uses RMS (more
 			 * stable, click-only channels don't get over-weighted). */
-			float weight_level = (arch_mode == 0 && det_up == 1)
+			float weight_level = (arch_mode == 0 && detector_mode == 1)
 			                       ? lvl_peak : lvl_rms;
 			float level_db = lin_to_db(weight_level);
 			float w = smoothstep_f(
@@ -593,17 +558,19 @@ void engine_process_block(const float *const *in_bufs, float *const *out_bufs,
 			sc_rms_db = sc_peak_db = sc_peak_dk_db = -120.0f;
 		}
 
-		/* Jede Stufe nimmt, was fuer sie eingestellt ist. Der Ducker
-		 * greift auf seinen eigenen Peak-Folger zurueck, wenn dieser
-		 * laeuft - siehe need_duck_peak. */
-		float sc_up_db = (det_up == 1) ? sc_peak_db : sc_rms_db;
-		float sc_dn_db = (det_down == 1)
-		                   ? (need_duck_peak ? sc_peak_dk_db : sc_peak_db)
-		                   : sc_rms_db;
+		/* Pick which SC each stage uses. */
+		float sc_up_db, sc_dn_db;
+		if ((arch_mode == 1 || arch_mode == 2) && detector_mode == 2) {
+			/* Zonal + dual: RMS for upward stages, Peak for duck. */
+			sc_up_db = sc_rms_db;
+			sc_dn_db = sc_peak_dk_db;
+		} else if (detector_mode == 1) {
+			sc_up_db = sc_dn_db = sc_peak_db;
+		} else {
+			sc_up_db = sc_dn_db = sc_rms_db;
+		}
 		/* Reporter publishes the upward-side SC (primary for the user). */
 		sc_block_last = sc_up_db;
-		if (sc_up_db > sc_block_max) sc_block_max = sc_up_db;
-		sc_dn_block_last = sc_dn_db;
 
 		/* ---- Gain target ---- */
 		float gain_target_db;
@@ -732,25 +699,17 @@ void engine_process_block(const float *const *in_bufs, float *const *out_bufs,
 
 	/* Publish per-block meter results (max-of-stored-vs-block). */
 	for (int ch = 0; ch < N_CHANNELS; ch++) {
-		for (int c = 0; c < METER_CONSUMERS; c++) {
-			float prev_in = atomic_load_explicit(&peak_in_acc[c][ch], memory_order_relaxed);
-			if (peak_in_block[ch] > prev_in) {
-				atomic_store_explicit(&peak_in_acc[c][ch], peak_in_block[ch], memory_order_relaxed);
-			}
-			float prev_out = atomic_load_explicit(&peak_out_acc[c][ch], memory_order_relaxed);
-			if (peak_out_block[ch] > prev_out) {
-				atomic_store_explicit(&peak_out_acc[c][ch], peak_out_block[ch], memory_order_relaxed);
-			}
+		float prev_in = atomic_load_explicit(&peak_in_acc[ch], memory_order_relaxed);
+		if (peak_in_block[ch] > prev_in) {
+			atomic_store_explicit(&peak_in_acc[ch], peak_in_block[ch], memory_order_relaxed);
+		}
+		float prev_out = atomic_load_explicit(&peak_out_acc[ch], memory_order_relaxed);
+		if (peak_out_block[ch] > prev_out) {
+			atomic_store_explicit(&peak_out_acc[ch], peak_out_block[ch], memory_order_relaxed);
 		}
 		atomic_store_explicit(&weight_acc[ch], weight_block[ch], memory_order_relaxed);
 	}
-	for (int c = 0; c < METER_CONSUMERS; c++) {
-		float prev_sc = atomic_load_explicit(&sc_max_acc[c], memory_order_relaxed);
-		if (sc_block_max > prev_sc)
-			atomic_store_explicit(&sc_max_acc[c], sc_block_max, memory_order_relaxed);
-	}
 	atomic_store_explicit(&current_sc_db,           sc_block_last,   memory_order_relaxed);
-	atomic_store_explicit(&current_sc_dn_db,        sc_dn_block_last, memory_order_relaxed);
 	atomic_store_explicit(&current_gain_atomic_db,  gain_block_last, memory_order_relaxed);
 }
 
@@ -861,31 +820,26 @@ static void send_eight_floats(struct sockaddr_in *dst, const char *path, const f
 	sendto(osc_socket, buf, off, 0, (struct sockaddr*)dst, sizeof(*dst));
 }
 
-static void purge_subscribers(time_t now);   /* weiter unten */
-
 /* Snapshot current state, send to subscribers. Called by peak reporter. */
 static void broadcast_meters(void) {
 	float pin[N_CHANNELS], pout[N_CHANNELS], wts[N_CHANNELS];
 	for (int ch = 0; ch < N_CHANNELS; ch++) {
-		float p_in_lin  = atomic_exchange(&peak_in_acc[METER_NET][ch],  0.0f);
-		float p_out_lin = atomic_exchange(&peak_out_acc[METER_NET][ch], 0.0f);
+		float p_in_lin  = atomic_exchange(&peak_in_acc[ch],  0.0f);
+		float p_out_lin = atomic_exchange(&peak_out_acc[ch], 0.0f);
 		pin[ch]  = lin_to_db(p_in_lin);
 		pout[ch] = lin_to_db(p_out_lin);
 		wts[ch]  = atomic_load_explicit(&weight_acc[ch], memory_order_relaxed);
 	}
 	float sc_db   = atomic_load_explicit(&current_sc_db,          memory_order_relaxed);
 	float gain_db = atomic_load_explicit(&current_gain_atomic_db, memory_order_relaxed);
-	float sc_max  = atomic_exchange(&sc_max_acc[METER_NET], -120.0f);
 
 	pthread_mutex_lock(&subscriber_mtx);
-	purge_subscribers(time(NULL));
 	for (int s = 0; s < subscriber_count; s++) {
 		send_eight_floats(&subscribers[s], "/cinecomp/peaks_in",  pin);
 		send_eight_floats(&subscribers[s], "/cinecomp/peaks_out", pout);
 		send_eight_floats(&subscribers[s], "/cinecomp/weights",   wts);
 		send_one_float(&subscribers[s], "/cinecomp/sc_db",   sc_db);
 		send_one_float(&subscribers[s], "/cinecomp/gain_db", gain_db);
-		send_one_float(&subscribers[s], "/cinecomp/sc_max",  sc_max);
 	}
 	pthread_mutex_unlock(&subscriber_mtx);
 }
@@ -905,9 +859,7 @@ static void send_state(struct sockaddr_in *dst) {
 	send_one_float(dst, "/cinecomp/sc_hpf_hz",  atomic_load_explicit(&p_sc_hpf_hz,    memory_order_relaxed));
 	send_one_float(dst, "/cinecomp/lookahead_ms", atomic_load_explicit(&p_lookahead_ms, memory_order_relaxed));
 	send_one_float(dst, "/cinecomp/max_gain",   atomic_load_explicit(&p_max_gain_db,  memory_order_relaxed));
-	send_one_int  (dst, "/cinecomp/detector",   engine_get_param_i(PARAM_DETECTOR_MODE));
-	send_one_int  (dst, "/cinecomp/det_up",     atomic_load_explicit(&p_det_up,   memory_order_relaxed));
-	send_one_int  (dst, "/cinecomp/det_down",   atomic_load_explicit(&p_det_down, memory_order_relaxed));
+	send_one_int  (dst, "/cinecomp/detector",   atomic_load_explicit(&p_detector_mode, memory_order_relaxed));
 	send_one_int  (dst, "/cinecomp/downward/enable",   atomic_load_explicit(&p_downward_en,    memory_order_relaxed));
 	send_one_float(dst, "/cinecomp/downward/threshold", atomic_load_explicit(&p_down_threshold, memory_order_relaxed));
 	send_one_float(dst, "/cinecomp/downward/ratio",     atomic_load_explicit(&p_down_ratio,     memory_order_relaxed));
@@ -934,43 +886,16 @@ static int sockaddr_eq(const struct sockaddr_in *a, const struct sockaddr_in *b)
 	return a->sin_addr.s_addr == b->sin_addr.s_addr && a->sin_port == b->sin_port;
 }
 
-/* Abgelaufene Abonnenten austragen. Mit gehaltenem Mutex zu rufen. */
-static void purge_subscribers(time_t now) {
-	for (int i = subscriber_count - 1; i >= 0; i--) {
-		if (now - subscriber_seen[i] > SUBSCRIBER_TTL) {
-			if (verbose) fprintf(stderr, "subscriber timeout: %s:%d\n",
-			                     inet_ntoa(subscribers[i].sin_addr),
-			                     ntohs(subscribers[i].sin_port));
-			subscribers[i]      = subscribers[subscriber_count - 1];
-			subscriber_seen[i]  = subscriber_seen[subscriber_count - 1];
-			subscriber_count--;
-		}
-	}
-}
-
 static void subscribe(const struct sockaddr_in *src) {
-	time_t now = time(NULL);
 	pthread_mutex_lock(&subscriber_mtx);
 	for (int i = 0; i < subscriber_count; i++) {
 		if (sockaddr_eq(&subscribers[i], src)) {
-			subscriber_seen[i] = now;      /* Auffrischen, nicht verdoppeln */
 			pthread_mutex_unlock(&subscriber_mtx);
 			return;
 		}
 	}
-	purge_subscribers(now);
-	if (subscriber_count >= MAX_SUBSCRIBERS) {
-		/* Voll und keiner abgelaufen: den aeltesten hergeben. Ein neuer
-		 * Abonnent, der gerade fragt, ist mehr wert als einer, der seit
-		 * Sekunden schweigt. */
-		int oldest = 0;
-		for (int i = 1; i < subscriber_count; i++)
-			if (subscriber_seen[i] < subscriber_seen[oldest]) oldest = i;
-		subscribers[oldest]     = *src;
-		subscriber_seen[oldest] = now;
-	} else {
-		subscriber_seen[subscriber_count] = now;
-		subscribers[subscriber_count++]   = *src;
+	if (subscriber_count < MAX_SUBSCRIBERS) {
+		subscribers[subscriber_count++] = *src;
 		if (verbose) fprintf(stderr, "subscribe: %s:%d (now %d)\n",
 		                     inet_ntoa(src->sin_addr), ntohs(src->sin_port),
 		                     subscriber_count);
@@ -982,9 +907,7 @@ static void unsubscribe(const struct sockaddr_in *src) {
 	pthread_mutex_lock(&subscriber_mtx);
 	for (int i = 0; i < subscriber_count; i++) {
 		if (sockaddr_eq(&subscribers[i], src)) {
-			subscribers[i]     = subscribers[subscriber_count - 1];
-			subscriber_seen[i] = subscriber_seen[subscriber_count - 1];
-			subscriber_count--;
+			subscribers[i] = subscribers[--subscriber_count];
 			break;
 		}
 	}
@@ -1017,15 +940,10 @@ static void handle_osc(const uint8_t *buf, int len, struct sockaddr_in *src) {
 	else if (strcmp(path, "/cinecomp/max_gain") == 0) atomic_store(&p_max_gain_db, fclampf(READ_F(12.0f), 0.0f, 30.0f));
 	else if (strcmp(path, "/cinecomp/detector") == 0) {
 		int v = READ_I(0);
-		/* 0=RMS, 1=Peak, 2=Dual (zonal only). Clamp to [0,2].
-		 * Setzt beide Richtungen, siehe engine_set_param_i. */
+		/* 0=RMS, 1=Peak, 2=Dual (zonal only). Clamp to [0,2]. */
 		if (v < 0) v = 0; else if (v > 2) v = 2;
-		engine_set_param_i(PARAM_DETECTOR_MODE, v);
+		atomic_store(&p_detector_mode, v);
 	}
-	else if (strcmp(path, "/cinecomp/det_up") == 0)
-		atomic_store(&p_det_up, READ_I(1) ? 1 : 0);
-	else if (strcmp(path, "/cinecomp/det_down") == 0)
-		atomic_store(&p_det_down, READ_I(1) ? 1 : 0);
 	else if (strcmp(path, "/cinecomp/downward/enable") == 0) atomic_store(&p_downward_en, READ_I(0) ? 1 : 0);
 	else if (strcmp(path, "/cinecomp/downward/threshold") == 0) atomic_store(&p_down_threshold, fclampf(READ_F(-6.0f), -60.0f, 0.0f));
 	else if (strcmp(path, "/cinecomp/downward/ratio") == 0) atomic_store(&p_down_ratio, fclampf(READ_F(4.0f), 1.0f, 20.0f));
@@ -1323,19 +1241,7 @@ void engine_set_param_f(engine_param_t id, float v) {
 int engine_get_param_i(engine_param_t id) {
 	switch (id) {
 	case PARAM_MAKEUP_FOLLOW_DIALOG: return atomic_load(&p_makeup_follow_dialog);
-	case PARAM_DETECTOR_MODE: {
-		/* Abgeleitet, damit alte Leser (OSC, Presets) etwas Sinnvolles
-		 * sehen. Peak oben / RMS unten hat keine alte Entsprechung und
-		 * meldet sich als Peak - fuer diese Kombination gibt es
-		 * PARAM_DET_UP und PARAM_DET_DOWN. */
-		int u = atomic_load(&p_det_up), d = atomic_load(&p_det_down);
-		if (u == 0 && d == 0) return 0;
-		if (u == 1 && d == 1) return 1;
-		if (u == 0 && d == 1) return 2;
-		return 1;
-	}
-	case PARAM_DET_UP:            return atomic_load(&p_det_up);
-	case PARAM_DET_DOWN:          return atomic_load(&p_det_down);
+	case PARAM_DETECTOR_MODE:     return atomic_load(&p_detector_mode);
 	case PARAM_DOWNWARD_EN:       return atomic_load(&p_downward_en);
 	case PARAM_BYPASS:            return atomic_load(&p_bypass);
 	case PARAM_ARCHITECTURE_MODE: return atomic_load(&p_architecture_mode);
@@ -1346,17 +1252,11 @@ int engine_get_param_i(engine_param_t id) {
 void engine_set_param_i(engine_param_t id, int v) {
 	switch (id) {
 	case PARAM_DETECTOR_MODE: {
-		/* Setzt beide Richtungen auf einmal - das ist der Weg, auf dem
-		 * alte Presets und alte OSC-Sender weiter ankommen. */
 		int x = v;
 		if (x < 0) x = 0; else if (x > 2) x = 2;
 		atomic_store(&p_detector_mode, x);
-		atomic_store(&p_det_up,   (x == 1) ? 1 : 0);
-		atomic_store(&p_det_down, (x == 0) ? 0 : 1);
 		break;
 	}
-	case PARAM_DET_UP:   atomic_store(&p_det_up,   v ? 1 : 0); break;
-	case PARAM_DET_DOWN: atomic_store(&p_det_down, v ? 1 : 0); break;
 	case PARAM_DOWNWARD_EN:       atomic_store(&p_downward_en, v ? 1 : 0); break;
 	case PARAM_BYPASS:            atomic_store(&p_bypass,      v ? 1 : 0); break;
 	case PARAM_MAKEUP_FOLLOW_DIALOG:
@@ -1374,16 +1274,14 @@ void engine_set_param_i(engine_param_t id, int v) {
 void engine_read_meters(engine_meters_t *out) {
 	if (!out) return;
 	for (int ch = 0; ch < ENGINE_N_CHANNELS; ch++) {
-		float p_in  = atomic_exchange(&peak_in_acc[METER_LOCAL][ch],  0.0f);
-		float p_out = atomic_exchange(&peak_out_acc[METER_LOCAL][ch], 0.0f);
+		float p_in  = atomic_exchange(&peak_in_acc[ch],  0.0f);
+		float p_out = atomic_exchange(&peak_out_acc[ch], 0.0f);
 		out->peak_in[ch]  = lin_to_db(p_in);
 		out->peak_out[ch] = lin_to_db(p_out);
 		out->weight[ch]   = atomic_load_explicit(&weight_acc[ch], memory_order_relaxed);
 	}
 	out->sc_db   = atomic_load_explicit(&current_sc_db,           memory_order_relaxed);
 	out->gain_db = atomic_load_explicit(&current_gain_atomic_db,  memory_order_relaxed);
-	out->sc_max  = atomic_exchange(&sc_max_acc[METER_LOCAL], -120.0f);
-	out->sc_dn_db = atomic_load_explicit(&current_sc_dn_db, memory_order_relaxed);
 }
 
 /* ----------------------- Presets ---------------------------------------
@@ -1424,7 +1322,7 @@ static const engine_preset_t factory_presets[PRESET__COUNT] = {
 			[PARAM_DUCK_ATTACK_MS]   =   9.0f,
 			[PARAM_DUCK_RELEASE_MS]  =  51.0f,
 		},
-		.detector_mode     = 1, .det_up = -1, .det_down = -1,
+		.detector_mode     = 1,
 		.downward_en       = 0,
 		.architecture_mode = 2,
 	},
@@ -1457,7 +1355,7 @@ static const engine_preset_t factory_presets[PRESET__COUNT] = {
 			[PARAM_DUCK_ATTACK_MS]   =   9.0f,
 			[PARAM_DUCK_RELEASE_MS]  =  51.0f,
 		},
-		.detector_mode     = 1, .det_up = -1, .det_down = -1,
+		.detector_mode     = 1,
 		.downward_en       = 1,
 		.architecture_mode = 2,
 	},
@@ -1490,7 +1388,7 @@ static const engine_preset_t factory_presets[PRESET__COUNT] = {
 			[PARAM_DUCK_ATTACK_MS]   =   9.0f,
 			[PARAM_DUCK_RELEASE_MS]  =  51.0f,
 		},
-		.detector_mode     = 1, .det_up = -1, .det_down = -1,
+		.detector_mode     = 1,
 		.downward_en       = 1,
 		.architecture_mode = 2,
 	},
@@ -1550,13 +1448,7 @@ static void preset_apply_live(const engine_preset_t *p) {
 	for (int i = 0; i < PARAM__FLOAT_COUNT; i++) {
 		engine_set_param_f((engine_param_t)i, p->f[i]);
 	}
-	/* Reihenfolge zaehlt: der Sammelschalter setzt beide Richtungen, die
-	 * beiden Einzelwerte ueberschreiben ihn danach. Ein altes Preset ohne
-	 * die neuen Felder traegt dort -1 und laesst den Sammelschalter
-	 * stehen. */
 	engine_set_param_i(PARAM_DETECTOR_MODE,     p->detector_mode);
-	if (p->det_up   >= 0) engine_set_param_i(PARAM_DET_UP,   p->det_up);
-	if (p->det_down >= 0) engine_set_param_i(PARAM_DET_DOWN, p->det_down);
 	engine_set_param_i(PARAM_DOWNWARD_EN,       p->downward_en);
 	engine_set_param_i(PARAM_ARCHITECTURE_MODE, p->architecture_mode);
 }
@@ -1583,8 +1475,6 @@ void engine_preset_save(engine_preset_slot_t slot) {
 		p.f[i] = engine_get_param_f((engine_param_t)i);
 	}
 	p.detector_mode     = engine_get_param_i(PARAM_DETECTOR_MODE);
-	p.det_up            = engine_get_param_i(PARAM_DET_UP);
-	p.det_down          = engine_get_param_i(PARAM_DET_DOWN);
 	p.downward_en       = engine_get_param_i(PARAM_DOWNWARD_EN);
 	p.architecture_mode = engine_get_param_i(PARAM_ARCHITECTURE_MODE);
 
@@ -1700,8 +1590,6 @@ int engine_named_save(const char *name) {
 		p.f[i] = engine_get_param_f((engine_param_t)i);
 	}
 	p.detector_mode     = engine_get_param_i(PARAM_DETECTOR_MODE);
-	p.det_up            = engine_get_param_i(PARAM_DET_UP);
-	p.det_down          = engine_get_param_i(PARAM_DET_DOWN);
 	p.downward_en       = engine_get_param_i(PARAM_DOWNWARD_EN);
 	p.architecture_mode = engine_get_param_i(PARAM_ARCHITECTURE_MODE);
 
@@ -1769,7 +1657,7 @@ static const named_preset_t factory_named[] = {
 		[PARAM_NOISE_FLOOR_DB]=-80, [PARAM_NOISE_KNEE_DB]=10.5f,
 		[PARAM_UPWARD_ATTACK_MS]=451, [PARAM_UPWARD_RELEASE_MS]=20,
 		[PARAM_DUCK_ATTACK_MS]=9, [PARAM_DUCK_RELEASE_MS]=51,
-	}, .detector_mode=1, .det_up=-1, .det_down=-1, .downward_en=0, .architecture_mode=2 } },
+	}, .detector_mode=1, .downward_en=0, .architecture_mode=2 } },
 	{ "90ies Mid", { .f = {
 		[PARAM_THRESHOLD]=-10, [PARAM_RATIO]=6, [PARAM_ATTACK_MS]=5,
 		[PARAM_RELEASE_MS]=800, [PARAM_HOLD_MS]=0, [PARAM_KNEE_DB]=16.5f,
@@ -1781,7 +1669,7 @@ static const named_preset_t factory_named[] = {
 		[PARAM_NOISE_FLOOR_DB]=-80, [PARAM_NOISE_KNEE_DB]=10.5f,
 		[PARAM_UPWARD_ATTACK_MS]=451, [PARAM_UPWARD_RELEASE_MS]=20,
 		[PARAM_DUCK_ATTACK_MS]=9, [PARAM_DUCK_RELEASE_MS]=51,
-	}, .detector_mode=1, .det_up=-1, .det_down=-1, .downward_en=1, .architecture_mode=2 } },
+	}, .detector_mode=1, .downward_en=1, .architecture_mode=2 } },
 	{ "90ies Hi", { .f = {
 		[PARAM_THRESHOLD]=-10, [PARAM_RATIO]=6, [PARAM_ATTACK_MS]=5,
 		[PARAM_RELEASE_MS]=800, [PARAM_HOLD_MS]=0, [PARAM_KNEE_DB]=16.5f,
@@ -1793,7 +1681,7 @@ static const named_preset_t factory_named[] = {
 		[PARAM_NOISE_FLOOR_DB]=-80, [PARAM_NOISE_KNEE_DB]=10.5f,
 		[PARAM_UPWARD_ATTACK_MS]=451, [PARAM_UPWARD_RELEASE_MS]=20,
 		[PARAM_DUCK_ATTACK_MS]=9, [PARAM_DUCK_RELEASE_MS]=51,
-	}, .detector_mode=1, .det_up=-1, .det_down=-1, .downward_en=1, .architecture_mode=2 } },
+	}, .detector_mode=1, .downward_en=1, .architecture_mode=2 } },
 	{ "Modern Low", { .f = {
 		[PARAM_THRESHOLD]=-10, [PARAM_RATIO]=6, [PARAM_ATTACK_MS]=5,
 		[PARAM_RELEASE_MS]=800, [PARAM_HOLD_MS]=0, [PARAM_KNEE_DB]=16.5f,
@@ -1805,7 +1693,7 @@ static const named_preset_t factory_named[] = {
 		[PARAM_NOISE_FLOOR_DB]=-80, [PARAM_NOISE_KNEE_DB]=10.5f,
 		[PARAM_UPWARD_ATTACK_MS]=451, [PARAM_UPWARD_RELEASE_MS]=20,
 		[PARAM_DUCK_ATTACK_MS]=9, [PARAM_DUCK_RELEASE_MS]=51,
-	}, .detector_mode=1, .det_up=-1, .det_down=-1, .downward_en=0, .architecture_mode=2 } },
+	}, .detector_mode=1, .downward_en=0, .architecture_mode=2 } },
 	{ "Modern Mid", { .f = {
 		[PARAM_THRESHOLD]=-10, [PARAM_RATIO]=6, [PARAM_ATTACK_MS]=5,
 		[PARAM_RELEASE_MS]=800, [PARAM_HOLD_MS]=0, [PARAM_KNEE_DB]=16.5f,
@@ -1817,7 +1705,7 @@ static const named_preset_t factory_named[] = {
 		[PARAM_NOISE_FLOOR_DB]=-80, [PARAM_NOISE_KNEE_DB]=10.5f,
 		[PARAM_UPWARD_ATTACK_MS]=451, [PARAM_UPWARD_RELEASE_MS]=20,
 		[PARAM_DUCK_ATTACK_MS]=9, [PARAM_DUCK_RELEASE_MS]=51,
-	}, .detector_mode=1, .det_up=-1, .det_down=-1, .downward_en=1, .architecture_mode=2 } },
+	}, .detector_mode=1, .downward_en=1, .architecture_mode=2 } },
 	{ "Modern Hi", { .f = {
 		[PARAM_THRESHOLD]=-10, [PARAM_RATIO]=6, [PARAM_ATTACK_MS]=5,
 		[PARAM_RELEASE_MS]=800, [PARAM_HOLD_MS]=0, [PARAM_KNEE_DB]=16.5f,
@@ -1829,7 +1717,7 @@ static const named_preset_t factory_named[] = {
 		[PARAM_NOISE_FLOOR_DB]=-80, [PARAM_NOISE_KNEE_DB]=10.5f,
 		[PARAM_UPWARD_ATTACK_MS]=451, [PARAM_UPWARD_RELEASE_MS]=20,
 		[PARAM_DUCK_ATTACK_MS]=9, [PARAM_DUCK_RELEASE_MS]=51,
-	}, .detector_mode=1, .det_up=-1, .det_down=-1, .downward_en=1, .architecture_mode=2 } },
+	}, .detector_mode=1, .downward_en=1, .architecture_mode=2 } },
 };
 
 /* Install the built-in stock presets. Only inserts a name that is not

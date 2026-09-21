@@ -55,6 +55,9 @@ static const char *const ctl_name[N_CTL] = {
     "Duck attack (ms)",      "Duck release (ms)",
     "Detector mode",         "Downward enable",       "Bypass",
     "Architecture mode",     "Makeup follows dialog",
+    /* Reihenfolge wie in engine_param_t - beide ans ENDE, damit die
+     * Nummern der bestehenden Anschluesse sich nicht verschieben. */
+    "Detector up (0=RMS 1=Peak)", "Detector down (0=RMS 1=Peak)",
 };
 
 /* Ranges are deliberately generous: the engine clamps what it needs to, and a
@@ -104,6 +107,8 @@ static const struct { float lo, hi; int deflt; int integer; } ctl_range[N_CTL] =
         { 0.0f, 1.0f, DEF_MIN, 1 },  /* bypass           */
         { 0.0f, 2.0f, DEF_MAX, 1 },  /* architecture     */
         { 0.0f, 1.0f, DEF_MIN, 1 },  /* makeup follows   */
+        { 0.0f, 1.0f, DEF_MAX, 1 },  /* detector up      */
+        { 0.0f, 1.0f, DEF_MAX, 1 },  /* detector down    */
 };
 
 /* Port layout: n audio in, n audio out, then all controls. */
@@ -159,6 +164,62 @@ static void apply_param_file(void)
     fclose(f);
 }
 
+
+/* Der Graph im mpv-Menue liest eine Zeile "key=value ..." - dasselbe Format,
+ * das filmcomp-osc auf amos schreibt. Also schreibt das Plugin sie hier selbst,
+ * dann zeichnet dieselbe Anzeige ohne Aenderung. Kuerzel wie in FC_PARAMS.
+ * Geschrieben wird aus dem Watcher-Thread, nie aus dem Audio-Thread. */
+#define METERFILE_ENV "CINECOMP_METER"
+#define METERFILE_DEF "/dev/shm/cinecomp-meter"
+
+static char     meter_path[512];
+static unsigned meter_seq;   /* das Menue nimmt nur Zeilen mit neuer Nummer */
+
+static void write_meter_file(void)
+{
+    engine_meters_t m;
+    engine_read_meters(&m);
+
+    char tmp[600];
+    snprintf(tmp, sizeof tmp, "%s.tmp", meter_path);
+    FILE *f = fopen(tmp, "w");
+    if (!f) return;
+    fprintf(f,
+        "conn=1 n=%u sc=%.2f scx=%.2f gain=%.2f "
+        "at=%.2f ak=%.2f am=%.2f dt=%.2f dk=%.2f dm=%.2f "
+        "nf=%.2f nk=%.2f dn=%.2f dr=%.2f "
+        "ua=%.0f ur=%.0f da=%.0f de=%.0f wd=%.3f mk=%.2f "
+        "dne=%d kn=%.2f scd=%.2f\n",
+        /* sc_max ist der lauteste Wert seit dem letzten Lesen - der
+         * Peak Hold im Menue braucht den Moment, nicht den Momentanwert. */
+        ++meter_seq, m.sc_db, m.sc_max, m.gain_db,
+        engine_get_param_f(PARAM_ATMO_THRESHOLD),
+        engine_get_param_f(PARAM_ATMO_KNEE),
+        engine_get_param_f(PARAM_ATMO_MAX_GAIN),
+        engine_get_param_f(PARAM_DIALOG_THRESHOLD),
+        engine_get_param_f(PARAM_DIALOG_KNEE),
+        engine_get_param_f(PARAM_DIALOG_MAX_GAIN),
+        engine_get_param_f(PARAM_NOISE_FLOOR_DB),
+        engine_get_param_f(PARAM_NOISE_KNEE_DB),
+        engine_get_param_f(PARAM_DOWN_THRESHOLD),
+        engine_get_param_f(PARAM_DOWN_RATIO),
+        engine_get_param_f(PARAM_UPWARD_ATTACK_MS),
+        engine_get_param_f(PARAM_UPWARD_RELEASE_MS),
+        engine_get_param_f(PARAM_DUCK_ATTACK_MS),
+        engine_get_param_f(PARAM_DUCK_RELEASE_MS),
+        engine_get_param_f(PARAM_WET_DRY),
+        engine_get_param_f(PARAM_MAKEUP_DB),
+        /* Ohne dne bleibt fc_duck() im Menue aus und die Kurve kann gar nicht
+         * unter null gehen; kn ist das Knie, mit dem es dort rechnet. */
+        engine_get_param_i(PARAM_DOWNWARD_EN),
+        engine_get_param_f(PARAM_KNEE_DB),
+        /* Der Sidechain der Abwaertsstufe - im Dual-Betrieb der Peak. */
+        m.sc_dn_db);
+    fclose(f);
+    /* Erst umbenennen: der Leser sieht nie eine halbe Zeile. */
+    rename(tmp, meter_path);
+}
+
 static void *watch_fn(void *arg)
 {
     (void)arg;
@@ -172,7 +233,11 @@ static void *watch_fn(void *arg)
             last_ns = st.st_mtim.tv_nsec;
             apply_param_file();
         }
-        usleep(100000);      /* 100 ms is far below what a hand can turn */
+        write_meter_file();
+        /* 50 Hz. Der alte Kommentar sagte "so schnell wie die Engine sonst
+         * sendet" und meinte 20 - seit dem 13.9.2026 sendet sie 50, und die
+         * Anzeige auf muaddib lief deshalb sichtbar hinterher. */
+        usleep(20000);
     }
     return NULL;
 }
@@ -189,6 +254,11 @@ static void watch_start(void)
         const char *home = getenv("HOME");
         snprintf(param_path, sizeof param_path, "%s%s",
                  home ? home : "/tmp", PARAMFILE_DEF);
+    }
+    {
+        const char *me = getenv(METERFILE_ENV);
+        snprintf(meter_path, sizeof meter_path, "%s",
+                 (me && *me) ? me : METERFILE_DEF);
     }
     apply_param_file();          /* initial state before the first block */
     watch_running = 1;
@@ -211,6 +281,8 @@ static void watch_stop(void)
     watch_running = 0;
     pthread_mutex_unlock(&watch_lock);
     pthread_join(watch_thread, NULL);
+    FILE *f = fopen(meter_path, "w");
+    if (f) { fprintf(f, "conn=0\n"); fclose(f); }
 }
 
 /* ------------------------------------------------------------- life cycle */

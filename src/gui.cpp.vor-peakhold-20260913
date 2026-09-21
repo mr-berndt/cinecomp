@@ -113,8 +113,6 @@ static void state_save(const std::string &path) {
     f << "[live]\n";
     for (auto &m : FKEYS) f << m.key << " = " << engine_get_param_f(m.id) << "\n";
     f << "detector_mode     = " << engine_get_param_i(PARAM_DETECTOR_MODE)     << "\n";
-    f << "det_up            = " << engine_get_param_i(PARAM_DET_UP)            << "\n";
-    f << "det_down          = " << engine_get_param_i(PARAM_DET_DOWN)          << "\n";
     f << "downward_en       = " << engine_get_param_i(PARAM_DOWNWARD_EN)       << "\n";
     f << "bypass            = " << engine_get_param_i(PARAM_BYPASS)            << "\n";
     f << "makeup_follow_dialog = " << engine_get_param_i(PARAM_MAKEUP_FOLLOW_DIALOG) << "\n";
@@ -247,8 +245,6 @@ static void state_load(const std::string &path) {
             }
             if (found_f) continue;
             if      (key == "detector_mode")     engine_set_param_i(PARAM_DETECTOR_MODE,     std::atoi(val.c_str()));
-            else if (key == "det_up")            engine_set_param_i(PARAM_DET_UP,            std::atoi(val.c_str()));
-            else if (key == "det_down")          engine_set_param_i(PARAM_DET_DOWN,          std::atoi(val.c_str()));
             else if (key == "downward_en")       engine_set_param_i(PARAM_DOWNWARD_EN,       std::atoi(val.c_str()));
             else if (key == "bypass")            engine_set_param_i(PARAM_BYPASS,            std::atoi(val.c_str()));
             else if (key == "makeup_follow_dialog") engine_set_param_i(PARAM_MAKEUP_FOLLOW_DIALOG, std::atoi(val.c_str()));
@@ -313,9 +309,6 @@ namespace clr {
     constexpr ImVec4 dialog_blue = {0.380f, 0.580f, 0.880f, 1.0f};
     constexpr ImVec4 atmo_purple = {0.640f, 0.470f, 0.880f, 1.0f};
     constexpr ImVec4 duck_red    = {0.880f, 0.380f, 0.380f, 1.0f};
-    // The duck red is a curve colour and deliberately soft. The peak hold
-    // has to be seen at a glance from the sofa, so it gets a real red.
-    constexpr ImVec4 hold_red    = {1.000f, 0.130f, 0.130f, 1.0f};
 }
 
 static ImU32 col32(const ImVec4 &c, float a = 1.0f) {
@@ -476,28 +469,6 @@ static GainPair gain_target_view(float sc, int arch_mode) {
 // X-axis: side-chain SC in dB, range -80..0
 // Y-axis: gain applied (upward positive, downward negative), -20..+30 dB
 
-/* Peak hold for the curve marker. It jumps up at once, stands for three
- * seconds and then falls back - the same law the bar holds use, so both
- * halves of the window behave alike. Fed from the engine's sc_max, not from
- * the value that happened to be current when the frame was drawn: at twenty
- * frames a second the current value misses most of the sound. */
-static float g_sc_hold     = -120.0f;
-static float g_sc_hold_age = 0.0f;
-
-static void sc_hold_update(float sc_max, float dt) {
-    const float sticky = 3.0f;      /* seconds it stands still */
-    const float dbps   = 12.0f;     /* then falls this fast */
-    if (!std::isfinite(sc_max)) return;
-    if (sc_max > g_sc_hold) {
-        g_sc_hold     = sc_max;
-        g_sc_hold_age = 0.0f;
-    } else {
-        g_sc_hold_age += dt;
-        if (g_sc_hold_age > sticky)
-            g_sc_hold = std::max(-120.0f, g_sc_hold - dbps * dt);
-    }
-}
-
 static void draw_curve(ImVec2 area_min, ImVec2 area_max,
                        const engine_meters_t &m, int arch_mode) {
     ImDrawList *dl = ImGui::GetWindowDrawList();
@@ -595,23 +566,6 @@ static void draw_curve(ImVec2 area_min, ImVec2 area_max,
         ImVec2 p(gx, y2px(gain));
         dl->AddCircleFilled(p, 7.0f, col32(clr::amber, 0.30f));
         dl->AddCircleFilled(p, 3.6f, col32(clr::amber, 1.00f));
-    }
-
-    // Peak hold - a thin vertical tick crossing the curve at the loudest
-    // recent level, sticking out a little above and below. Its height is the
-    // curve's own value there, not the gain applied right now: the loud
-    // moment is over, only what it would get is still true.
-    if (std::isfinite(g_sc_hold) && g_sc_hold > x_lo) {
-        float hx = std::min(std::max(g_sc_hold, x_lo), x_hi);
-        float gx = x2px(hx);
-        GainPair gp = gain_target_view(hx, arch_mode);
-        float gy = gp.up;
-        if (gy < y_lo) gy = y_lo;
-        if (gy > y_hi) gy = y_hi;
-        float cy = y2px(gy);
-        const float half = 8.0f;
-        dl->AddLine(ImVec2(gx, cy - half), ImVec2(gx, cy + half),
-                    col32(clr::hold_red), 1.5f);
     }
 
     // Axis labels every 20 dB
@@ -826,12 +780,12 @@ int main(int argc, char **argv) {
     engine_named_seed_factory();
     state_load(opts.state_path);
 
-    // Architecture is fixed to zonal v2 (Classic/v1 retired).
+    // Architecture is fixed to zonal v2 (Classic/v1 retired) and the Dual
+    // detector was removed. Clamp any stale state.ini back to the supported
+    // set so an old file can't resurrect a dead mode.
     engine_set_param_i(PARAM_ARCHITECTURE_MODE, 2);
-    // Die alte Klemme auf "Dual ist tot" entfaellt seit dem 21.9.2026: die
-    // Kombination RMS oben / Peak unten ist jetzt ganz normal einstellbar,
-    // ein altes state.ini mit detector_mode = 2 bekommt also genau das,
-    // was dort stand, statt auf Peak/Peak gezwungen zu werden.
+    if (engine_get_param_i(PARAM_DETECTOR_MODE) == 2)
+        engine_set_param_i(PARAM_DETECTOR_MODE, 1);
 
     glfwSetErrorCallback([](int e, const char *m){ std::fprintf(stderr, "glfw: %d %s\n", e, m); });
     if (!glfwInit()) { engine_stop(); return 1; }
@@ -878,10 +832,7 @@ int main(int argc, char **argv) {
      * first event, and under a window manager that talks to its clients every
      * frame that means no limit at all - the loop then runs at whatever the
      * display will take. So the slot is sat out in a loop until it is over. */
-    /* Ten a second was enough for numbers, but not for a peak meter: a bar
-     * that is sampled ten times a second cannot look alive, however good the
-     * data behind it is. Twenty, on Nicola's word (13.9.2026). */
-    const double IDLE_DT = 1.0 / 20.0;
+    const double IDLE_DT = 1.0 / 10.0;
     const double BUSY_DT = 1.0 / 20.0;      /* while a control is being held */
 
     double t_next = 0.0, t_frame = 0.0, fps = 0.0, cpu_pct = 0.0;
@@ -949,7 +900,6 @@ int main(int argc, char **argv) {
                 upd(mtr.peak_in[ch],  disp_in[ch],  hold_in[ch],  hold_age_in[ch]);
                 upd(mtr.peak_out[ch], disp_out[ch], hold_out[ch], hold_age_out[ch]);
             }
-            sc_hold_update(mtr.sc_max, dt);
         }
 
         // OSC may have mutated active preset, any preset content, or the
@@ -1086,32 +1036,13 @@ int main(int argc, char **argv) {
             // zonal v2 (Classic/v1 retired), so only the detector mode and
             // bypass remain here.
             ImGui::Spacing();
-            // Zwei Schalter statt einem: die Aufwaertsstufe und der Ducker
-            // stellen verschiedene Fragen. Oben geht es darum, wie LAUT es im
-            // Mittel ist - dafuer ist RMS gebaut, ein einzelner Knall soll das
-            // Anheben nicht abwuergen. Der Ducker soll genau diesen Knall
-            // erwischen, und dafuer taugt nur Peak.
+            ImGui::TextColored(clr::text_sand, "Det"); ImGui::SameLine();
             const char *det_names[2] = { "RMS", "Peak" };
-            int det_u = engine_get_param_i(PARAM_DET_UP);
-            int det_d = engine_get_param_i(PARAM_DET_DOWN);
-            ImGui::TextColored(clr::text_sand, "Det auf"); ImGui::SameLine();
             for (int i = 0; i < 2; i++) {
                 if (i > 0) ImGui::SameLine();
-                if (seg_button(det_names[i], det_u == i, ImVec2(46, 24),
+                if (seg_button(det_names[i], det_mode == i, ImVec2(46, 24),
                                clr::mint)) {
-                    engine_set_param_i(PARAM_DET_UP, i);
-                    mark_dirty();
-                }
-            }
-            ImGui::SameLine(0, 10);
-            ImGui::TextColored(clr::text_sand, "ab"); ImGui::SameLine();
-            for (int i = 0; i < 2; i++) {
-                if (i > 0) ImGui::SameLine();
-                // Eigene Kennung, sonst haelt ImGui die vier Knoepfe fuer
-                // zwei - die Beschriftung ist die Kennung.
-                char lbl[16]; std::snprintf(lbl, sizeof lbl, "%s##ab", det_names[i]);
-                if (seg_button(lbl, det_d == i, ImVec2(46, 24), clr::mint)) {
-                    engine_set_param_i(PARAM_DET_DOWN, i);
+                    engine_set_param_i(PARAM_DETECTOR_MODE, i);
                     mark_dirty();
                 }
             }
@@ -1190,15 +1121,6 @@ int main(int argc, char **argv) {
             else
                 std::strcpy(buf, "—");
             dl->AddText(ImVec2(text_x, y), col32(clr::mint), buf);
-            /* The hold in red, right beside the live value: the loudest
-             * moment of the last three seconds - the same number the red
-             * tick on the curve is standing on. */
-            if (std::isfinite(g_sc_hold) && g_sc_hold > -60.0f) {
-                float vw = ImGui::CalcTextSize(buf).x;
-                char hbuf[16];
-                std::snprintf(hbuf, sizeof(hbuf), "%.1f", g_sc_hold);
-                dl->AddText(ImVec2(text_x + vw + 8, y), col32(clr::hold_red), hbuf);
-            }
             y += 18;
             dl->AddText(ImVec2(text_x, y), col32(clr::text_dim), "Gain");
             y += 14;
