@@ -3,3 +3,7 @@ cinecomp
 dist/
 .ccache/
 imgui.ini
+# old manual backups and test leftovers
+*.vor-*
+t.sock
+*.so

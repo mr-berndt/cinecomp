@@ -1,8 +1,0 @@
-{"command":["get_property","brightness"]}
-{"command":["add","brightness",0.2]}
-{"command":["get_property","brightness"]}
-{"command":["add","gamma",0.1]}
-{"command":["get_property","gamma"]}
-{"command":["add","brightness",1]}
-{"command":["get_property","brightness"]}
-{"command":["quit"]}
